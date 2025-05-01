@@ -240,6 +240,7 @@ urllib3==2.4.0
 uv==0.6.17
 uvicorn==0.34.2
 uvloop==0.21.0
+watchdog==6.0.0
 watchfiles==1.0.5
 wcwidth==0.2.13
 websocket-client==1.8.0

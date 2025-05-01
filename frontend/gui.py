@@ -1,53 +1,40 @@
-import streamlit as st
-import uuid
-st.set_page_config(page_title="AI Research Assistant", layout="wide")
-import requests
-import subprocess
-import time
+# frontend/app.py
+import sys
 import os
+import uuid
+import streamlit as st
 import streamlit.components.v1 as components
 import streamlit_javascript as stjs
+import asyncio
+import nest_asyncio
+from dotenv import load_dotenv
+load_dotenv()
+os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 
-# --- Start FastAPI backend server ---
-def start_backend():
-    try:
-        res = requests.get("http://localhost:8000/healthcheck", timeout=2)
-        if res.status_code == 200:
-            return  # Already running
-    except requests.exceptions.RequestException as e:
-        st.info("🟡 Backend not detected, attempting to start...")
+# Add backend/app to the import path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../backend/app")))
+from mcp.mcp_server import MCPServer 
 
-    backend_path = os.path.join(os.path.dirname(__file__), "../backend")
-    try:
-        backend_process = subprocess.Popen(
-            ["uvicorn", "app.main:app", "--reload"],
-            cwd=backend_path,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        time.sleep(3)
-        return backend_process
-    except Exception as e:
-        st.error(f"❌ Failed to start backend server: {e}")
-        raise
+# Configure Streamlit
+st.set_page_config(page_title="AI Research Assistant", layout="wide")
 
-# Call once at startup
-backend_process = start_backend()
+# Initialize MCP server
+mcp_server = MCPServer()
 
-
+# === Session State ===
 if "chats" not in st.session_state:
     st.session_state.chats = {}
     new_id = str(uuid.uuid4())
     st.session_state.active_chat = new_id
     st.session_state.chats[new_id] = {"title": "New Chat", "history": []}
+if "provider" not in st.session_state:
+    st.session_state.provider = "groq"
+    st.session_state.model = "gpt-4"
 
-
-# Sidebar chat management
+# === Sidebar ===
 with st.sidebar:
     st.markdown("## 💬 Chats")
-    chat_ids = list(st.session_state.chats.keys())
-    for chat_id in chat_ids:
-        chat = st.session_state.chats[chat_id]
+    for chat_id, chat in st.session_state.chats.items():
         is_active = st.session_state.active_chat == chat_id
         bg_color = "#2f2f2f" if is_active else "transparent"
         st.markdown(
@@ -55,7 +42,8 @@ with st.sidebar:
             <div id="chat-{chat_id}" class="chat-item" style="padding: 8px 12px; margin-bottom: 8px; border-radius: 6px; background-color: {bg_color}; cursor: pointer;">
                 {chat['title']}
             </div>
-            """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True
+        )
 
     components.html("""
     <script>
@@ -79,17 +67,18 @@ with st.sidebar:
     """, height=0)
 
     event = stjs.st_javascript("window.addEventListener('message', e => { Streamlit.setComponentValue(e.data) })")
-
     if event:
-        if event.get("type") == "rename_chat":
-            st.session_state.rename_id = event.get("id")
-        elif event.get("type") == "delete_chat":
-            del st.session_state.chats[event.get("id")]
-            if st.session_state.active_chat == event.get("id"):
+        event_type = event.get("type")
+        event_id = event.get("id")
+        if event_type == "rename_chat":
+            st.session_state.rename_id = event_id
+        elif event_type == "delete_chat":
+            del st.session_state.chats[event_id]
+            if st.session_state.active_chat == event_id:
                 st.session_state.active_chat = next(iter(st.session_state.chats), None)
             st.experimental_rerun()
-        elif event.get("type") == "switch_chat":
-            st.session_state.active_chat = event.get("id")
+        elif event_type == "switch_chat":
+            st.session_state.active_chat = event_id
             st.experimental_rerun()
 
     if st.button("➕ New Chat"):
@@ -97,7 +86,23 @@ with st.sidebar:
         st.session_state.chats[new_id] = {"title": "New Chat", "history": []}
         st.session_state.active_chat = new_id
 
+    # Provider / Model Settings
+    st.markdown("## ⚙️ Settings")
+    provider = st.selectbox("LLM Provider", ["groq", "openai", "gemini"],
+                            index=["groq", "openai", "gemini"].index(st.session_state.provider))
+    model = st.text_input("Model", value=st.session_state.model)
 
+    if st.button("✅ Update Model"):
+        mcp_server.update_model_settings(model=model, provider=provider)
+        st.session_state.provider = provider
+        st.session_state.model = model
+        st.success(f"✅ Model set to `{model}` using `{provider}`")
+
+    # # File Upload
+    # st.markdown("## 📎 Upload Files")
+    # uploaded_files = st.file_uploader("Upload PDFs, CSVs, or TXTs", type=["pdf", "csv", "txt"], accept_multiple_files=True)
+
+# === Rename Chat UI ===
 if "rename_id" in st.session_state:
     rid = st.session_state.rename_id
     if rid in st.session_state.chats:
@@ -106,26 +111,26 @@ if "rename_id" in st.session_state:
             st.session_state.chats[rid]["title"] = new_name.strip()
             del st.session_state.rename_id
             st.experimental_rerun()
-        elif new_name == "":
-            # Prevent empty name, keep rename input open
-            pass
     else:
         del st.session_state.rename_id
 
-
+# === Main Chat UI ===
 st.title("🧠 AI Research Assistant")
 
 current_chat_id = st.session_state.active_chat
-current_chat = st.session_state.chats.get(current_chat_id, {"history": []})
+current_chat = st.session_state.chats[current_chat_id]
+
 for role, msg in current_chat["history"]:
-    if role == "user":
-        with st.chat_message("user", avatar="🧑‍💻"):
-            st.markdown(msg)
-    else:
-        with st.chat_message("assistant", avatar="🤖"):
-            st.markdown(msg)
+    with st.chat_message(role, avatar="🧑‍💻" if role == "user" else "🤖"):
+        st.markdown(msg)
+
 st.markdown("---")
 
+# Define asynchronous handler
+async def handle_prompt(prompt):
+    return await mcp_server.route(prompt)
+
+# === Prompt Handling ===
 if prompt := st.chat_input("Ask me anything..."):
     current_chat["history"].append(("user", prompt.strip()))
     with st.chat_message("user", avatar="🧑‍💻"):
@@ -134,19 +139,9 @@ if prompt := st.chat_input("Ask me anything..."):
     with st.chat_message("assistant", avatar="🤖"):
         with st.spinner("Thinking..."):
             try:
-                response = requests.post(
-                    "http://localhost:8000/chat",
-                    json={"user_input": prompt}
-                )
-                if response.ok:
-                    result = response.json()
-                    output = result.get("content") or result.get("final_output", "❌ No response.")
-                    if output:
-                        current_chat["history"].append(("assistant", output))
-                        st.markdown(output)
-                    else:
-                        st.markdown("⚠️ No content returned.")
-                else:
-                    st.error(f"❌ Server error: {response.status_code} - {response.text}")
-            except requests.exceptions.RequestException as e:
-                st.error(f"🚨 Failed to connect to backend: {e}")
+                result = asyncio.run(handle_prompt(prompt))
+                output = result.get("final_output", "❌ No response.")
+                current_chat["history"].append(("assistant", output))
+                st.markdown(output)
+            except Exception as e:
+                st.error(f"🚨 Failed to generate response: {e}")

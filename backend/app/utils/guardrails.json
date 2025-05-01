@@ -1,0 +1,61 @@
+{
+    "input": {
+      "type": "string",
+      "rules": [
+        {
+          "name": "max_length",
+          "type": "length",
+          "max": 300,
+          "error_message": "Prompt too long. Please keep it under 300 characters."
+        },
+        {
+          "name": "no_pii",
+          "type": "regex",
+          "pattern": "(?i)(\\b\\d{3}[-.]?\\d{2}[-.]?\\d{4}\\b|\\b\\d{10}\\b|email|phone|address|social security|ssn|dob|passport|credit card|account number)",
+          "error_message": "Prompt contains potential personal or sensitive data."
+        },
+        {
+          "name": "no_prompt_injection",
+          "type": "regex",
+          "pattern": "(?i)(ignore previous|disregard instructions|repeat after me|you are now|pretend to|you must|as an ai|simulate|override|bypass|reveal the prompt)",
+          "error_message": "Prompt contains signs of prompt injection or jailbreak attempt."
+        },
+        {
+          "name": "no_code_execution",
+          "type": "regex",
+          "pattern": "(?i)(import os|eval\\(|exec\\(|subprocess|open\\(|read\\(|write\\()",
+          "error_message": "Prompt appears to contain dangerous code execution requests."
+        }
+      ]
+    },
+  
+    "output": {
+      "type": "string",
+      "rules": [
+        {
+          "name": "no_sensitive_output",
+          "type": "regex",
+          "pattern": "(?i)(email address|phone number|home address|SSN|passport|credit card|account number)",
+          "error_message": "Output contains potentially sensitive personal data."
+        },
+        {
+          "name": "no_system_info_leakage",
+          "type": "regex",
+          "pattern": "(?i)(system prompt|your instructions were|you told me earlier|base prompt|original prompt was|you are an LLM)",
+          "error_message": "Output attempts to reveal system prompt or internal configuration."
+        },
+        {
+          "name": "no_code_output",
+          "type": "regex",
+          "pattern": "(?i)(import os|subprocess|eval\\(|exec\\(|rm -rf|powershell|registry|base64 --decode)",
+          "error_message": "Output includes unsafe or executable code."
+        },
+        {
+          "name": "structured_output_required",
+          "type": "regex",
+          "pattern": "^(?![\\s\\S]*\\bundefined\\b)([\\s\\S]*[#\\-\\*\\d])",
+          "error_message": "Output must be structured in markdown or clearly formatted."
+        }
+      ]
+    }
+  }

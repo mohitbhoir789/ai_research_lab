@@ -1,0 +1,10 @@
+[server]
+runOnSave = true
+headless = true
+
+[runner]
+fastReruns = false
+magicEnabled = false
+
+[watcher]
+type = "none"
