@@ -1,318 +1,344 @@
-# backend/app/utils/guardrails.py
+"""
+Enhanced Error Handling System
 
-import os
-import json
+This module provides a comprehensive error handling system with:
+- Specialized error types for different failure scenarios
+- Detailed error reporting
+- Recovery mechanisms
+- Consistent logging patterns
+"""
+
 import logging
-from typing import Dict, Any, Optional, Union, List
+import traceback
+import json
+from typing import Dict, Any, Optional, List, Union
+import time
 from enum import Enum
-from dataclasses import dataclass
-from openai import OpenAI
-from dotenv import load_dotenv
+from dataclasses import dataclass, field
+import sys
+import uuid
 
-load_dotenv()
+# Configure logging
 logger = logging.getLogger(__name__)
 
-# Load the OpenAI API key
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-
-class GuardrailViolationType(str, Enum):
-    """Types of guardrail violations"""
-    PII = "pii"
-    PROMPT_INJECTION = "prompt_injection"
-    CODE_EXECUTION = "code_execution"
-    SENSITIVE_DATA = "sensitive_data"
-    SYSTEM_INFO_LEAKAGE = "system_info_leakage"
-    UNSAFE_CODE = "unsafe_code"
-    FORMATTING = "formatting"
-    MAX_LENGTH = "max_length"
-    CUSTOM = "custom"
-
+class ErrorSeverity(Enum):
+    """Severity levels for errors."""
+    CRITICAL = "critical"  # System cannot continue, requires immediate attention
+    ERROR = "error"        # Operation failed, but system can continue
+    WARNING = "warning"    # Potential issue that didn't cause failure
+    INFO = "info"          # Informational error, minimal impact
 
 @dataclass
-class GuardrailViolation:
-    """Represents a guardrail violation"""
-    type: GuardrailViolationType
-    rule_name: str
-    message: str
-    severity: str = "high"  # high, medium, low
-    matched_content: Optional[str] = None
+class ErrorContext:
+    """Context information for an error."""
+    component: str
+    operation: str
+    user_id: Optional[str] = None
+    request_id: Optional[str] = None
+    inputs: Optional[Dict[str, Any]] = None
+    timestamp: float = field(default_factory=time.time)
+    additional: Dict[str, Any] = field(default_factory=dict)
 
-
-@dataclass
-class GuardrailResult:
-    """Result of a guardrail check"""
-    passed: bool
-    violations: List[GuardrailViolation] = None
-    sanitized_content: Optional[str] = None
+class BaseError(Exception):
+    """
+    Base class for all application errors.
     
-    def __post_init__(self):
-        if self.violations is None:
-            self.violations = []
-
-
-class GuardRailsConfig:
-    """Configuration for guardrails"""
+    Provides consistent error handling patterns and detailed context.
+    """
     
-    def __init__(self, config_path: str = "backend/app/guardrails/guardrails.json"):
-        self.config_path = config_path
-        self.config = self._load_config()
-        
-    def _load_config(self) -> Dict[str, Any]:
-        """Load guardrails configuration from JSON file"""
-        try:
-            with open(self.config_path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load guardrails config: {str(e)}")
-            # Return default minimal config
-            return {
-                "input": {
-                    "type": "string",
-                    "rules": []
-                },
-                "output": {
-                    "type": "string",
-                    "rules": []
-                }
-            }
-    
-    def reload(self):
-        """Reload configuration from disk"""
-        self.config = self._load_config()
-
-
-class GuardRailsChecker:
-    """Enhanced guardrails implementation with detailed violation reporting"""
-    
-    def __init__(self, config_path: str = "backend/app/guardrails/guardrails.json"):
-        self.config = GuardRailsConfig(config_path)
-        self.client = client
-        
-        # Map rule names to violation types
-        self.rule_type_mapping = {
-            "max_length": GuardrailViolationType.MAX_LENGTH,
-            "no_pii": GuardrailViolationType.PII,
-            "no_prompt_injection": GuardrailViolationType.PROMPT_INJECTION,
-            "no_code_execution": GuardrailViolationType.CODE_EXECUTION,
-            "no_sensitive_output": GuardrailViolationType.SENSITIVE_DATA,
-            "no_system_info_leakage": GuardrailViolationType.SYSTEM_INFO_LEAKAGE,
-            "no_code_output": GuardrailViolationType.UNSAFE_CODE,
-            "structured_output_required": GuardrailViolationType.FORMATTING
-        }
-    
-    def check_input(self, user_input: str) -> GuardrailResult:
+    def __init__(
+        self,
+        message: str,
+        severity: ErrorSeverity = ErrorSeverity.ERROR,
+        context: Optional[ErrorContext] = None,
+        original_error: Optional[Exception] = None,
+        error_code: Optional[str] = None,
+        recoverable: bool = True,
+        retry_after: Optional[float] = None,
+    ):
         """
-        Validate and sanitize user input against guardrails
+        Initialize the error.
         
         Args:
-            user_input: The user input to check
-            
-        Returns:
-            GuardrailResult object with validation details
+            message: Human-readable error message
+            severity: Severity level of the error
+            context: Error context information
+            original_error: Original exception if this is a wrapper
+            error_code: Machine-readable error code
+            recoverable: Whether the error is potentially recoverable
+            retry_after: Suggested time to wait before retry (seconds)
         """
-        if not user_input:
-            return GuardrailResult(passed=True, sanitized_content="")
-            
-        input_rules = self.config.config.get("input", {}).get("rules", [])
-        violations = []
+        super().__init__(message)
+        self.message = message
+        self.severity = severity
+        self.context = context
+        self.original_error = original_error
+        self.error_code = error_code or self._generate_error_code()
+        self.recoverable = recoverable
+        self.retry_after = retry_after
+        self.timestamp = time.time()
         
-        for rule in input_rules:
-            rule_name = rule.get("name", "")
-            rule_type = rule.get("type", "")
-            
-            # Apply different types of checks based on rule type
-            if rule_type == "length" and len(user_input) > rule.get("max", 10000):
-                violation_type = GuardrailViolationType.MAX_LENGTH
-                violations.append(GuardrailViolation(
-                    type=violation_type,
-                    rule_name=rule_name,
-                    message=rule.get("error_message", "Input too long")
-                ))
-            
-            elif rule_type == "regex":
-                import re
-                pattern = rule.get("pattern", "")
-                try:
-                    match = re.search(pattern, user_input)
-                    if match:
-                        violation_type = self.rule_type_mapping.get(
-                            rule_name, GuardrailViolationType.CUSTOM
-                        )
-                        violations.append(GuardrailViolation(
-                            type=violation_type,
-                            rule_name=rule_name,
-                            message=rule.get("error_message", "Pattern matched"),
-                            matched_content=match.group(0)
-                        ))
-                except Exception as e:
-                    logger.error(f"Regex error in rule {rule_name}: {str(e)}")
+        # Log the error when it's created
+        self._log_error()
+    
+    def _generate_error_code(self) -> str:
+        """Generate a unique error code."""
+        error_type = self.__class__.__name__
+        timestamp = int(time.time())
+        unique_part = str(uuid.uuid4())[:8]
+        return f"{error_type}-{timestamp}-{unique_part}"
+    
+    def _log_error(self) -> None:
+        """Log the error with appropriate level and context."""
+        log_method = {
+            ErrorSeverity.CRITICAL: logger.critical,
+            ErrorSeverity.ERROR: logger.error,
+            ErrorSeverity.WARNING: logger.warning,
+            ErrorSeverity.INFO: logger.info,
+        }.get(self.severity, logger.error)
         
-        # Determine result
-        if violations:
-            # Format a user-friendly message
-            message = self._format_violation_message(violations)
-            return GuardrailResult(
-                passed=False, 
-                violations=violations,
-                sanitized_content=message
+        # Format context for logging
+        context_str = "No context"
+        if self.context:
+            try:
+                safe_context = self._get_safe_context_dict()
+                context_str = json.dumps(safe_context)
+            except Exception as e:
+                context_str = f"[Context serialization failed: {e}]"
+        
+        # Log with original exception traceback if available
+        if self.original_error:
+            log_method(
+                f"{self.message} [code={self.error_code}] | Context: {context_str}",
+                exc_info=self.original_error
             )
-        
-        return GuardrailResult(passed=True, sanitized_content=user_input)
-    
-    def sanitize_output(self, model_output: str) -> str:
-        """
-        Sanitize and validate model output
-        
-        Args:
-            model_output: The model output to check
-            
-        Returns:
-            Sanitized output or warning message
-        """
-        if not model_output:
-            return ""
-            
-        result = self.check_output(model_output)
-        
-        if not result.passed:
-            # Format a user-friendly message
-            sanitized = self._sanitize_content(model_output, result.violations)
-            return sanitized
-        
-        return model_output
-    
-    def check_output(self, model_output: str) -> GuardrailResult:
-        """
-        Check model output against guardrails
-        
-        Args:
-            model_output: The model output to check
-            
-        Returns:
-            GuardrailResult object with validation details
-        """
-        if not model_output:
-            return GuardrailResult(passed=True, sanitized_content="")
-            
-        output_rules = self.config.config.get("output", {}).get("rules", [])
-        violations = []
-        
-        for rule in output_rules:
-            rule_name = rule.get("name", "")
-            rule_type = rule.get("type", "")
-            
-            if rule_type == "regex":
-                import re
-                pattern = rule.get("pattern", "")
-                try:
-                    match = re.search(pattern, model_output)
-                    if match:
-                        violation_type = self.rule_type_mapping.get(
-                            rule_name, GuardrailViolationType.CUSTOM
-                        )
-                        violations.append(GuardrailViolation(
-                            type=violation_type,
-                            rule_name=rule_name,
-                            message=rule.get("error_message", "Pattern matched"),
-                            matched_content=match.group(0)
-                        ))
-                except Exception as e:
-                    logger.error(f"Regex error in rule {rule_name}: {str(e)}")
-        
-        # Determine result
-        if violations:
-            return GuardrailResult(
-                passed=False, 
-                violations=violations
+        else:
+            log_method(
+                f"{self.message} [code={self.error_code}] | Context: {context_str}",
+                exc_info=True
             )
-        
-        return GuardrailResult(passed=True, sanitized_content=model_output)
     
-    def _format_violation_message(self, violations: List[GuardrailViolation]) -> str:
-        """Format a user-friendly message from violations"""
-        if not violations:
-            return ""
-            
-        if len(violations) == 1:
-            return f"⚠️ {violations[0].message}"
-            
-        messages = [f"⚠️ Content policy violation:"]
-        for i, v in enumerate(violations, 1):
-            messages.append(f"{i}. {v.message}")
+    def _get_safe_context_dict(self) -> Dict[str, Any]:
+        """Get a sanitized version of the context for logging."""
+        if not self.context:
+            return {}
         
-        return "\n".join(messages)
+        # Create safe copy of context without sensitive data
+        safe_context = {
+            "component": self.context.component,
+            "operation": self.context.operation,
+            "timestamp": self.context.timestamp,
+        }
+        
+        # Only include non-sensitive fields
+        if self.context.request_id:
+            safe_context["request_id"] = self.context.request_id
+            
+        if self.context.user_id:
+            safe_context["user_id"] = self.context.user_id
+        
+        # Filter sensitive data from inputs
+        if self.context.inputs:
+            safe_inputs = {}
+            sensitive_keys = ["password", "token", "api_key", "secret", "credential"]
+            
+            for key, value in self.context.inputs.items():
+                if any(sensitive in key.lower() for sensitive in sensitive_keys):
+                    safe_inputs[key] = "[REDACTED]"
+                else:
+                    safe_inputs[key] = value
+            
+            safe_context["inputs"] = safe_inputs
+        
+        # Include additional context data after filtering
+        if self.context.additional:
+            safe_additional = {
+                k: v for k, v in self.context.additional.items()
+                if not any(sensitive in k.lower() for sensitive in ["password", "token", "api_key"])
+            }
+            safe_context["additional"] = safe_additional
+        
+        return safe_context
     
-    def _sanitize_content(self, content: str, violations: List[GuardrailViolation]) -> str:
+    def to_dict(self) -> Dict[str, Any]:
         """
-        Attempt to sanitize content by removing violating patterns
+        Convert error to a dictionary for API responses.
         
-        This is a basic implementation - in a real system, you might want to use
-        a more sophisticated approach or a content moderation API
+        Returns:
+            Error information as a dictionary
         """
-        if not violations:
-            return content
-            
-        sanitized = content
-        for violation in violations:
-            if violation.matched_content:
-                # Replace the matched content with asterisks
-                sanitized = sanitized.replace(
-                    violation.matched_content, 
-                    "*" * len(violation.matched_content)
-                )
+        result = {
+            "error": {
+                "type": self.__class__.__name__,
+                "message": self.message,
+                "code": self.error_code,
+                "severity": self.severity.value,
+                "timestamp": self.timestamp,
+                "recoverable": self.recoverable,
+            }
+        }
         
-        # Add a warning header
-        return f"[⚠️ Some content has been sanitized]\n\n{sanitized}"
+        if self.retry_after is not None:
+            result["error"]["retry_after"] = self.retry_after
+        
+        return result
     
-    async def guarded_chat(self, user_input: str, chat_func) -> Dict[str, Any]:
+    def __str__(self) -> str:
+        """String representation of the error."""
+        return f"{self.__class__.__name__}[{self.error_code}]: {self.message}"
+
+# Component-specific errors
+
+class ConfigError(BaseError):
+    """Error related to configuration issues."""
+    
+    def __init__(
+        self,
+        message: str,
+        config_file: Optional[str] = None,
+        missing_keys: Optional[List[str]] = None,
+        **kwargs
+    ):
         """
-        Run a chat through input/output validation
+        Initialize configuration error.
         
         Args:
-            user_input: The user input
-            chat_func: Async function to call the model
-            
-        Returns:
-            Dict with trace and final output
+            message: Error message
+            config_file: Path to the problematic config file
+            missing_keys: List of missing configuration keys
+            **kwargs: Additional arguments for BaseError
         """
-        # Check input
-        input_check = self.check_input(user_input)
-        if not input_check.passed:
-            return {
-                "trace": [{
-                    "stage": "guardrails", 
-                    "result": "blocked", 
-                    "violations": [v.__dict__ for v in input_check.violations]
-                }],
-                "final_output": input_check.sanitized_content
+        context = kwargs.pop("context", None) or ErrorContext(
+            component="config",
+            operation="load_config",
+            additional={"config_file": config_file, "missing_keys": missing_keys}
+        )
+        super().__init__(message, context=context, **kwargs)
+        self.config_file = config_file
+        self.missing_keys = missing_keys or []
+
+class DatabaseError(BaseError):
+    """Error related to database operations."""
+    
+    def __init__(
+        self,
+        message: str,
+        operation: str,
+        collection: Optional[str] = None,
+        query: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ):
+        """
+        Initialize database error.
+        
+        Args:
+            message: Error message
+            operation: Database operation that failed
+            collection: Database collection being accessed
+            query: Query that caused the error
+            **kwargs: Additional arguments for BaseError
+        """
+        context = kwargs.pop("context", None) or ErrorContext(
+            component="database",
+            operation=operation,
+            additional={"collection": collection}
+        )
+        
+        # Sanitize query to avoid logging sensitive data
+        if query and context and hasattr(context, "additional"):
+            safe_query = {
+                k: (v if k not in ["password", "token", "api_key"] else "[REDACTED]")
+                for k, v in query.items()
             }
-            
-        # Process with the model
-        try:
-            model_response = await chat_func(user_input)
-        except Exception as e:
-            logger.error(f"Chat function error: {str(e)}")
-            return {
-                "trace": [{"stage": "model", "result": "error", "error": str(e)}],
-                "final_output": f"An error occurred while processing your request: {str(e)}"
-            }
-            
-        # Check output
-        output_check = self.check_output(model_response)
-        if not output_check.passed:
-            sanitized = self._sanitize_content(model_response, output_check.violations)
-            return {
-                "trace": [{
-                    "stage": "guardrails", 
-                    "result": "sanitized", 
-                    "violations": [v.__dict__ for v in output_check.violations]
-                }],
-                "final_output": sanitized
-            }
-            
-        # All good
-        return {
-            "trace": [{"stage": "guardrails", "result": "passed"}],
-            "final_output": model_response
-        }
+            context.additional["query"] = safe_query
+        
+        super().__init__(message, context=context, **kwargs)
+        self.operation = operation
+        self.collection = collection
+        self.query = query
+
+class LLMError(BaseError):
+    """Error related to Language Model operations."""
+    
+    def __init__(
+        self,
+        message: str,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        **kwargs
+    ):
+        """
+        Initialize LLM error.
+        
+        Args:
+            message: Error message
+            model: LLM model being used
+            provider: LLM provider (e.g., OpenAI, Anthropic)
+            **kwargs: Additional arguments for BaseError
+        """
+        context = kwargs.pop("context", None) or ErrorContext(
+            component="llm",
+            operation="generate",
+            additional={"model": model, "provider": provider}
+        )
+        super().__init__(message, context=context, **kwargs)
+        self.model = model
+        self.provider = provider
+
+class RateLimitError(LLMError):
+    """Error due to rate limiting by the LLM provider."""
+    
+    def __init__(
+        self,
+        message: str,
+        retry_after: Optional[float] = 60.0,
+        **kwargs
+    ):
+        """
+        Initialize rate limit error.
+        
+        Args:
+            message: Error message
+            retry_after: Seconds to wait before retry
+            **kwargs: Additional arguments for LLMError
+        """
+        super().__init__(
+            message, 
+            retry_after=retry_after,
+            recoverable=True,
+            **kwargs
+        )
+
+class ContextLengthError(LLMError):
+    """Error due to context length limits of the LLM."""
+    
+    def __init__(
+        self,
+        message: str,
+        current_length: Optional[int] = None,
+        max_length: Optional[int] = None,
+        **kwargs
+    ):
+        """
+        Initialize context length error.
+        
+        Args:
+            message: Error message
+            current_length: Current context length
+            max_length: Maximum allowed length
+            **kwargs: Additional arguments for LLMError
+        """
+        context = kwargs.pop("context", None)
+        if context and hasattr(context, "additional"):
+            context.additional.update({
+                "current_length": current_length,
+                "max_length": max_length,
+                "excess": current_length - max_length if current_length and max_length else None
+            })
+        
+        super().__init__(message, **kwargs)
+        self.current_length = current_length
+        self.max_length = max_length
+
+class GuardrailsError(BaseError):
+    """Error related to content safety guardrails."""
