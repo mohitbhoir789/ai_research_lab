@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.log
+
+# Virtualenv
+venv/
+env/
+
+# Environment variables
+.env
+
+# IDE specific
+.vscode/
+.idea/
+
+# Mac specific
+.DS_Store
+
+# FastAPI specific
+*.sqlite3
+.pdf
