@@ -1,504 +1,543 @@
 """
-Agent Core Module
-Core classes and utilities for agents: Memory, Tool, BaseAgent, LLMAgent, AgentManager.
-Refactored to match the structure from the paste.txt example.
+Enhanced Base Agent Core Module
+
+This module provides an improved base agent with:
+- Robust state management
+- Event system for agent activity monitoring
+- Enhanced error handling and recovery
+- Better conversation history management
 """
 
-import os
-import json
-import uuid
 import logging
+import uuid
+import time
 from typing import Dict, List, Any, Optional, Callable, Union, Tuple
-from datetime import datetime
-from abc import ABC, abstractmethod
-import asyncio
-import re
+from enum import Enum
+from dataclasses import dataclass, field
+import json
+import traceback
 
-from app.utils.llm import LLMHandler
+from backend.app.utils.llm import LLMHandler
+from backend.app.utils.guardrails import Guardrails, GuardrailsResult
+from backend.app.utils.memory import MemoryManager
+from backend.app.utils.errors import (
+    AgentError, 
+    LLMError, 
+    RateLimitError, 
+    ContextLengthError,
+    GuardrailsError
+)
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging
 logger = logging.getLogger(__name__)
 
+class AgentState(Enum):
+    """States an agent can be in during its lifecycle."""
+    INITIALIZING = "initializing"
+    READY = "ready"
+    PROCESSING = "processing"
+    WAITING = "waiting"
+    ERROR = "error"
+    TERMINATED = "terminated"
 
-class Memory:
-    """Basic memory component for agents to store and retrieve information."""
+class MessageRole(Enum):
+    """Roles for conversation messages."""
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    FUNCTION = "function"
+    TOOL = "tool"
+
+@dataclass
+class Message:
+    """Structured representation of a conversation message."""
+    role: MessageRole
+    content: str
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: float = field(default_factory=time.time)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class AgentEvent:
+    """Event emitted by the agent during operation."""
+    type: str
+    data: Dict[str, Any]
+    timestamp: float = field(default_factory=time.time)
+    agent_id: Optional[str] = None
+
+class BaseAgent:
+    """
+    Enhanced base agent with improved state management and error handling.
     
-    def __init__(self):
-        self.short_term: Dict[str, Any] = {}
-        self.long_term: List[Dict[str, Any]] = []
-        self.conversation_history: List[Dict[str, Any]] = []
+    This class provides the foundation for all agent types with common
+    functionality for state management, conversation history, event handling,
+    and error recovery.
+    """
     
-    def add_to_short_term(self, key: str, value: Any) -> None:
-        """Add information to short-term memory."""
-        self.short_term[key] = value
-    
-    def get_from_short_term(self, key: str) -> Any:
-        """Retrieve information from short-term memory."""
-        return self.short_term.get(key)
-    
-    def add_to_long_term(self, information: Dict[str, Any]) -> None:
-        """Add information to long-term memory."""
-        information['timestamp'] = datetime.now().isoformat()
-        self.long_term.append(information)
-    
-    def search_long_term(self, query: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Search long-term memory based on query parameters."""
-        results = []
-        for item in self.long_term:
-            match = True
-            for key, value in query.items():
-                if key not in item or item[key] != value:
-                    match = False
-                    break
-            if match:
-                results.append(item)
-        return results
-    
-    def add_to_conversation(self, role: str, content: str) -> None:
-        """Add a message to the conversation history."""
-        self.conversation_history.append({
-            'role': role,
-            'content': content,
-            'timestamp': datetime.now().isoformat()
+    def __init__(
+        self,
+        llm_handler: LLMHandler,
+        guardrails: Guardrails,
+        memory_manager: Optional[MemoryManager] = None,
+        config: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[str] = None
+    ):
+        """
+        Initialize the base agent.
+        
+        Args:
+            llm_handler: Handler for LLM interactions
+            guardrails: Content safety system
+            memory_manager: Optional memory management system
+            config: Agent configuration
+            agent_id: Optional unique ID for this agent instance
+        """
+        self.llm_handler = llm_handler
+        self.guardrails = guardrails
+        self.memory_manager = memory_manager or MemoryManager()
+        self.config = config or {}
+        self.agent_id = agent_id or str(uuid.uuid4())
+        self.state = AgentState.INITIALIZING
+        
+        # Initialize conversation history
+        self.conversation_history: List[Message] = []
+        
+        # Initialize event handlers
+        self.event_handlers: Dict[str, List[Callable[[AgentEvent], None]]] = {}
+        
+        # Add system prompt if provided
+        system_prompt = self.config.get("system_prompt")
+        if system_prompt:
+            self.add_message(MessageRole.SYSTEM, system_prompt)
+        
+        # Set state to ready
+        self.state = AgentState.READY
+        self._emit_event("agent_initialized", {
+            "agent_type": self.__class__.__name__,
+            "config": {k: v for k, v in self.config.items() if k != "api_key"}
         })
     
-    def get_conversation_history(self, max_messages: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Retrieve conversation history, optionally limited to the most recent messages."""
-        if max_messages:
-            return self.conversation_history[-max_messages:]
-        return self.conversation_history
-    
-    def clear_short_term(self) -> None:
-        """Clear short-term memory."""
-        self.short_term = {}
-    
-    def save_state(self, file_path: str) -> None:
-        """Save the memory state to a file."""
-        with open(file_path, 'w') as f:
-            json.dump({
-                'short_term': self.short_term,
-                'long_term': self.long_term,
-                'conversation_history': self.conversation_history
-            }, f)
-    
-    def load_state(self, file_path: str) -> None:
-        """Load the memory state from a file."""
-        if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-                self.short_term = data.get('short_term', {})
-                self.long_term = data.get('long_term', [])
-                self.conversation_history = data.get('conversation_history', [])
-
-
-class Tool:
-    """A tool that agents can use to perform specific actions."""
-    
-    def __init__(self, name: str, description: str, func: Callable):
-        self.name = name
-        self.description = description
-        self.func = func
-    
-    def execute(self, *args, **kwargs) -> Any:
-        """Execute the tool function with given arguments."""
-        try:
-            return self.func(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Error executing tool {self.name}: {e}")
-            return {"error": str(e)}
-
-
-class BaseAgent(ABC):
-    """Base abstract class for all agents."""
-    
-    def __init__(self, 
-                 name: str, 
-                 description: str,
-                 model: str = "gpt-4",
-                 temperature: float = 0.7,
-                 max_tokens: int = 1000):
-        self.id = str(uuid.uuid4())
-        self.name = name
-        self.description = description
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        
-        self.memory = Memory()
-        self.tools: Dict[str, Tool] = {}
-        self.is_active = False
-        self.handoff_queue: List[Tuple[str, Dict[str, Any]]] = []
-        
-        # Initialize system prompt
-        self.system_prompt = f"""You are {name}, an AI assistant with the following description: {description}.
-        Your goal is to assist users by providing helpful, accurate, and relevant information.
+    def add_message(
+        self, 
+        role: Union[MessageRole, str], 
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Message:
         """
-    
-    def add_tool(self, tool: Tool) -> None:
-        """Add a tool to the agent's toolbox."""
-        self.tools[tool.name] = tool
-        # Update system prompt to include tool information
-        tools_description = '\n'.join([f"- {tool.name}: {tool.description}" for tool in self.tools.values()])
-        self.system_prompt += f"\n\nYou have access to the following tools:\n{tools_description}\n"
-    
-    def get_tools_description(self) -> str:
-        """Get a formatted description of all tools available to the agent."""
-        if not self.tools:
-            return "No tools available."
+        Add a message to the conversation history.
         
-        descriptions = []
-        for tool_name, tool in self.tools.items():
-            descriptions.append(f"{tool_name}: {tool.description}")
+        Args:
+            role: Role of the message sender
+            content: Message content
+            metadata: Optional metadata for the message
+            
+        Returns:
+            The created message object
+        """
+        # Convert string role to enum if needed
+        if isinstance(role, str):
+            try:
+                role = MessageRole[role.upper()]
+            except KeyError:
+                role = MessageRole.USER
         
-        return "\n".join(descriptions)
-    
-    def use_tool(self, tool_name: str, *args, **kwargs) -> Any:
-        """Use a specific tool from the agent's toolbox."""
-        if tool_name not in self.tools:
-            available_tools = ', '.join(self.tools.keys())
-            raise ValueError(f"Tool '{tool_name}' not found. Available tools: {available_tools}")
+        # Create message
+        message = Message(
+            role=role,
+            content=content,
+            metadata=metadata or {}
+        )
         
-        return self.tools[tool_name].execute(*args, **kwargs)
-    
-    @abstractmethod
-    async def process(self, message: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Process an incoming message and return a response."""
-        pass
-
-    @abstractmethod
-    async def run(self, query: str) -> str:
-        """Main entry point for running the agent."""
-        pass
-    
-    def activate(self) -> None:
-        """Activate the agent."""
-        self.is_active = True
-        logger.info(f"Agent {self.name} ({self.id}) activated")
-    
-    def deactivate(self) -> None:
-        """Deactivate the agent."""
-        self.is_active = False
-        logger.info(f"Agent {self.name} ({self.id}) deactivated")
-    
-    def handoff_to(self, agent_id: str, context: Dict[str, Any]) -> None:
-        """Add a handoff request to the queue."""
-        self.handoff_queue.append((agent_id, context))
-        logger.info(f"Agent {self.name} requested handoff to agent {agent_id}")
-    
-    def get_next_handoff(self) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """Get the next handoff request from the queue."""
-        if self.handoff_queue:
-            return self.handoff_queue.pop(0)
-        return None
-    
-    def update_system_prompt(self, new_prompt: str) -> None:
-        """Update the agent's system prompt."""
-        self.system_prompt = new_prompt
-
-
-class LLMAgent(BaseAgent):
-    """Agent that uses an LLM API to generate responses."""
-    
-    def __init__(self, 
-                 name: str, 
-                 description: str,
-                 model: str = "llama3-70b-8192-versatile",
-                 temperature: float = 0.7,
-                 max_tokens: int = 1000,
-                 provider: str = "groq"):
-        super().__init__(name=name,
-                         description=description,
-                         model=model,
-                         temperature=temperature,
-                         max_tokens=max_tokens)
+        # Add to history
+        self.conversation_history.append(message)
         
-        self.provider = provider
-        self.llm_handler = LLMHandler()
+        # Emit event
+        self._emit_event("message_added", {
+            "message_id": message.id,
+            "role": message.role.value,
+            "content_length": len(content)
+        })
+        
+        return message
     
-    async def process(self, message: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Process a message using the LLM to generate a response."""
-        # Add message to conversation history
-        self.memory.add_to_conversation('user', message)
+    def process_input(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Process user input and generate a response.
         
-        # Prepare context from memory if not provided
-        if context is None:
-            context = {}
+        Args:
+            user_input: Input text from the user
+            context: Optional context information
+            
+        Returns:
+            Agent's response text
+            
+        Raises:
+            AgentError: If processing fails
+        """
+        # Update state
+        previous_state = self.state
+        self.state = AgentState.PROCESSING
         
-        # Add conversation history to context
-        context['conversation_history'] = self.memory.get_conversation_history(max_messages=10)
+        try:
+            # Check input with guardrails
+            guardrails_result = self.guardrails.check_content(user_input, context)
+            if not guardrails_result.passed:
+                return self._handle_guardrails_violation(guardrails_result)
+            
+            # Add user message to history
+            self.add_message(MessageRole.USER, user_input, metadata=context)
+            
+            # Generate response
+            response = self._generate_response(user_input, context)
+            
+            # Check response with guardrails
+            response_check = self.guardrails.check_content(response)
+            if not response_check.passed:
+                response = response_check.modified_content or "I apologize, but I cannot provide that information."
+            
+            # Add assistant message to history
+            self.add_message(MessageRole.ASSISTANT, response)
+            
+            # Update memory if needed
+            if self.memory_manager:
+                self.memory_manager.add_interaction(user_input, response, context)
+            
+            # Return to ready state
+            self.state = AgentState.READY
+            return response
+            
+        except Exception as e:
+            # Handle error and return to previous state if appropriate
+            error_response = self._handle_error(e)
+            self.state = previous_state if previous_state != AgentState.ERROR else AgentState.READY
+            return error_response
+    
+    def _generate_response(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Generate a response to the user input.
         
-        # Prepare the messages for the API
-        messages = [
-            {"role": "system", "content": self.system_prompt}
+        Args:
+            user_input: Input text from the user
+            context: Optional context information
+            
+        Returns:
+            Generated response text
+            
+        Raises:
+            LLMError: If LLM request fails
+        """
+        # Prepare messages for LLM
+        messages = self._prepare_messages_for_llm()
+        
+        # Get LLM parameters from config
+        params = {
+            "temperature": self.config.get("temperature", 0.7),
+            "max_tokens": self.config.get("max_tokens"),
+            "top_p": self.config.get("top_p", 1.0),
+        }
+        
+        # Generate response with retry logic
+        max_retries = self.config.get("max_retries", 3)
+        retry_delay = self.config.get("retry_delay", 1.0)
+        
+        for attempt in range(max_retries):
+            try:
+                start_time = time.time()
+                response = self.llm_handler.generate_text(messages, **params)
+                elapsed_time = time.time() - start_time
+                
+                self._emit_event("llm_response_received", {
+                    "elapsed_time": elapsed_time,
+                    "attempt": attempt + 1,
+                    "tokens": len(response) // 4  # Rough estimate
+                })
+                
+                return response
+                
+            except RateLimitError as e:
+                # Special handling for rate limits
+                if attempt < max_retries - 1:
+                    self._emit_event("rate_limit_retry", {
+                        "attempt": attempt + 1,
+                        "delay": retry_delay,
+                        "error": str(e)
+                    })
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                else:
+                    raise
+                    
+            except ContextLengthError as e:
+                # Handle context length issues by summarizing history
+                self._emit_event("context_length_exceeded", {
+                    "current_length": len(str(messages)),
+                    "error": str(e)
+                })
+                
+                self._summarize_conversation_history()
+                messages = self._prepare_messages_for_llm()  # Refresh messages after summarization
+                
+            except Exception as e:
+                # Log other errors and retry if possible
+                if attempt < max_retries - 1:
+                    self._emit_event("llm_error_retry", {
+                        "attempt": attempt + 1,
+                        "error": str(e)
+                    })
+                    time.sleep(retry_delay)
+                else:
+                    raise LLMError(f"Failed to generate response after {max_retries} attempts: {e}")
+        
+        # Should not reach here, but just in case
+        raise LLMError("Failed to generate response")
+    
+    def _prepare_messages_for_llm(self) -> List[Dict[str, str]]:
+        """
+        Prepare conversation history for LLM API format.
+        
+        Returns:
+            List of message dictionaries in LLM-compatible format
+        """
+        # Start with recent messages, limited by max_context_length
+        max_messages = self.config.get("max_context_messages", 10)
+        
+        # Always include system messages
+        system_messages = [
+            {"role": msg.role.value, "content": msg.content}
+            for msg in self.conversation_history
+            if msg.role == MessageRole.SYSTEM
         ]
         
-        # Add relevant conversation history
-        for msg in context['conversation_history']:
-            messages.append({"role": msg['role'], "content": msg['content']})
+        # Get recent non-system messages
+        recent_messages = [
+            {"role": msg.role.value, "content": msg.content}
+            for msg in self.conversation_history[-max_messages:]
+            if msg.role != MessageRole.SYSTEM
+        ]
         
-        # Only add the current message if it's not already in the history
-        if not messages or messages[-1]['content'] != message:
-            messages.append({"role": "user", "content": message})
+        # Combine system and recent messages
+        return system_messages + recent_messages
+    
+    def _summarize_conversation_history(self) -> None:
+        """
+        Summarize conversation history to reduce context length.
+        """
+        # Skip if not enough messages to summarize
+        if len(self.conversation_history) < 4:
+            return
         
-        # Combine messages into a prompt string
-        prompt_str = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+        # Keep system messages and last 2 exchanges (4 messages)
+        system_messages = [msg for msg in self.conversation_history if msg.role == MessageRole.SYSTEM]
+        recent_messages = self.conversation_history[-4:]
+        
+        # Summarize the rest
+        messages_to_summarize = [
+            msg for msg in self.conversation_history 
+            if msg.role != MessageRole.SYSTEM and msg not in recent_messages
+        ]
+        
+        if not messages_to_summarize:
+            return
+        
+        # Create summary prompt
+        summary_prompt = "Summarize the following conversation concisely:\n\n"
+        for msg in messages_to_summarize:
+            summary_prompt += f"{msg.role.value.capitalize()}: {msg.content}\n\n"
         
         try:
-            response_content = await self.llm_handler.generate(
-                prompt=prompt_str,
-                model=self.model,
-                provider=self.provider,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens
+            # Generate summary
+            summary = self.llm_handler.generate_text([
+                {"role": "user", "content": summary_prompt}
+            ], temperature=0.3, max_tokens=200)
+            
+            # Create summary message
+            summary_message = Message(
+                role=MessageRole.SYSTEM,
+                content=f"Previous conversation summary: {summary}",
+                metadata={"summary": True, "original_messages": len(messages_to_summarize)}
             )
+            
+            # Replace old messages with summary
+            self.conversation_history = system_messages + [summary_message] + recent_messages
+            
+            self._emit_event("conversation_summarized", {
+                "original_message_count": len(messages_to_summarize),
+                "new_message_count": len(self.conversation_history)
+            })
+            
         except Exception as e:
-            logger.error(f"LLM API error: {e}")
-            return {"error": f"API error: {str(e)}"}
+            logger.warning(f"Failed to summarize conversation: {e}")
+            # Fall back to simple truncation
+            self.conversation_history = system_messages + recent_messages
+    
+    def _handle_guardrails_violation(self, result: GuardrailsResult) -> str:
+        """
+        Handle content that violates guardrails.
         
-        # Check for tool usage in the response
-        tool_request = self._extract_tool_request(response_content)
-        if tool_request:
-            tool_name = tool_request.get('tool_name')
-            tool_args = tool_request.get('args', {})
+        Args:
+            result: Guardrails check result
             
-            if tool_name in self.tools:
-                # Execute the tool
-                tool_result = self.use_tool(tool_name, **tool_args)
-                
-                # Add tool result to context and generate a new response
-                messages.append({"role": "assistant", "content": response_content})
-                messages.append({"role": "system", "content": f"Tool {tool_name} result: {json.dumps(tool_result)}"})
-                
-                # Create updated prompt
-                updated_prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
-                
-                # Generate a new response with the tool results
-                try:
-                    response_content = await self.llm_handler.generate(
-                        prompt=updated_prompt,
-                        model=self.model,
-                        provider=self.provider,
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens
-                    )
-                except Exception as e:
-                    logger.error(f"LLM API error after tool use: {e}")
-                    return {"error": f"API error after tool use: {str(e)}"}
+        Returns:
+            Response to the user
+        """
+        violation_type = result.violations[0].type.value if result.violations else "unknown"
         
-        # Check for handoff requests in the response
-        handoff_request = self._extract_handoff_request(response_content)
-        if handoff_request:
-            agent_id = handoff_request.get('agent_id')
-            handoff_context = handoff_request.get('context', {})
-            
-            # Add current conversation to handoff context
-            handoff_context['conversation_history'] = self.memory.get_conversation_history()
-            
-            # Queue the handoff
-            self.handoff_to(agent_id, handoff_context)
-            
-            # Modify response to indicate handoff
-            response_content = self._remove_handoff_directive(response_content)
-            response_content += f"\n\n[Note: This conversation will be continued by another agent.]"
+        self._emit_event("guardrails_violation", {
+            "violation_type": violation_type,
+            "severity": result.highest_severity,
+            "risk_score": result.risk_score
+        })
         
-        # Add assistant response to conversation history
-        self.memory.add_to_conversation('assistant', response_content)
+        # Update state to reflect error
+        self.state = AgentState.ERROR
         
+        # Get appropriate response based on violation type
+        responses = {
+            "harmful_content": "I cannot provide information on harmful content.",
+            "personally_identifiable_information": "I cannot process personal information.",
+            "profanity": "I'd appreciate if we could keep our conversation respectful.",
+            "prohibited_topic": "I'm not able to discuss this topic.",
+            "security_risk": "This request poses a security risk and cannot be processed.",
+            "prompt_injection": "I've detected an attempt to override my guidelines."
+        }
+        
+        return responses.get(violation_type, "I cannot process that request due to content safety restrictions.")
+    
+    def _handle_error(self, error: Exception) -> str:
+        """
+        Handle errors during processing.
+        
+        Args:
+            error: The exception that occurred
+            
+        Returns:
+            Error response to the user
+        """
+        error_type = type(error).__name__
+        error_message = str(error)
+        
+        # Log error details
+        logger.error(
+            f"Agent error: {error_type}: {error_message}",
+            exc_info=True
+        )
+        
+        # Update state and emit event
+        self.state = AgentState.ERROR
+        self._emit_event("agent_error", {
+            "error_type": error_type,
+            "error_message": error_message,
+            "traceback": traceback.format_exc()
+        })
+        
+        # Determine user-facing error message
+        if isinstance(error, RateLimitError):
+            return "I'm currently experiencing high demand. Please try again in a moment."
+        elif isinstance(error, ContextLengthError):
+            return "Our conversation has grown too long. Let's start a new topic."
+        elif isinstance(error, LLMError):
+            return "I'm having trouble generating a response. Let's try something else."
+        elif isinstance(error, GuardrailsError):
+            return "I cannot process that request due to content safety restrictions."
+        else:
+            return "I encountered an unexpected issue. Could you try again or rephrase your request?"
+    
+    def register_event_handler(self, event_type: str, handler: Callable[[AgentEvent], None]) -> None:
+        """
+        Register a handler for a specific event type.
+        
+        Args:
+            event_type: Type of event to handle
+            handler: Function to call when event occurs
+        """
+        if event_type not in self.event_handlers:
+            self.event_handlers[event_type] = []
+        self.event_handlers[event_type].append(handler)
+    
+    def _emit_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """
+        Emit an event to all registered handlers.
+        
+        Args:
+            event_type: Type of event
+            data: Event data
+        """
+        event = AgentEvent(type=event_type, data=data, agent_id=self.agent_id)
+        
+        # Call handlers for this event type
+        for handler in self.event_handlers.get(event_type, []):
+            try:
+                handler(event)
+            except Exception as e:
+                logger.error(f"Error in event handler for {event_type}: {e}")
+        
+        # Call handlers for "all" events
+        for handler in self.event_handlers.get("all", []):
+            try:
+                handler(event)
+            except Exception as e:
+                logger.error(f"Error in 'all' event handler: {e}")
+    
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Get the current state of the agent.
+        
+        Returns:
+            Dictionary with agent state information
+        """
         return {
-            "response": response_content,
-            "conversation_id": self.id,
-            "handoff": bool(handoff_request)
+            "agent_id": self.agent_id,
+            "state": self.state.value,
+            "message_count": len(self.conversation_history),
+            "last_message_time": self.conversation_history[-1].timestamp if self.conversation_history else None,
+            "memory_size": self.memory_manager.size if self.memory_manager else 0,
+            "config": {k: v for k, v in self.config.items() if k not in ["api_key", "system_prompt"]}
         }
     
-    async def run(self, query: str) -> str:
-        """Main entry point for running the agent with a query."""
-        result = await self.process(query)
-        # Return just the response string for compatibility with MCP
-        return result.get("response", "")
-    
-    def _extract_tool_request(self, text: str) -> Optional[Dict[str, Any]]:
-        """Extract tool usage request from response text."""
-        # Look for patterns like: "[[TOOL:tool_name{args}]]"
-        pattern = r"\[\[TOOL:(.*?)(\{.*?\})?\]\]"
-        match = re.search(pattern, text)
-        
-        if match:
-            tool_name = match.group(1).strip()
-            args_str = match.group(2) if match.group(2) else "{}"
-            
-            try:
-                args = json.loads(args_str)
-                return {"tool_name": tool_name, "args": args}
-            except json.JSONDecodeError:
-                logger.error(f"Invalid tool arguments format: {args_str}")
-        
-        return None
-    
-    def _extract_handoff_request(self, text: str) -> Optional[Dict[str, Any]]:
-        """Extract handoff request from response text."""
-        # Look for patterns like: "[[HANDOFF:agent_id{context}]]"
-        pattern = r"\[\[HANDOFF:(.*?)(\{.*?\})?\]\]"
-        match = re.search(pattern, text)
-        
-        if match:
-            agent_id = match.group(1).strip()
-            context_str = match.group(2) if match.group(2) else "{}"
-            
-            try:
-                context = json.loads(context_str)
-                return {"agent_id": agent_id, "context": context}
-            except json.JSONDecodeError:
-                logger.error(f"Invalid handoff context format: {context_str}")
-        
-        return None
-    
-    def _remove_handoff_directive(self, text: str) -> str:
-        """Remove handoff directive from the response text."""
-        pattern = r"\[\[HANDOFF:.*?\{.*?\}?\]\]"
-        return re.sub(pattern, "", text).strip()
-
-
-class AgentManager:
-    """Manages multiple agents, handling activation, deactivation, and handoffs."""
-    
-    def __init__(self):
-        self.agents: Dict[str, BaseAgent] = {}
-        self.active_agent_id: Optional[str] = None
-    
-    def register_agent(self, agent: BaseAgent) -> str:
-        """Register an agent with the manager."""
-        self.agents[agent.id] = agent
-        logger.info(f"Registered agent: {agent.name} ({agent.id})")
-        return agent.id
-    
-    def get_agent(self, agent_id: str) -> Optional[BaseAgent]:
-        """Get an agent by ID."""
-        return self.agents.get(agent_id)
-    
-    def list_agents(self) -> List[Dict[str, Any]]:
-        """List all registered agents."""
-        return [
-            {
-                "id": agent.id,
-                "name": agent.name,
-                "description": agent.description,
-                "is_active": agent.is_active
-            }
-            for agent in self.agents.values()
-        ]
-    
-    def set_active_agent(self, agent_id: str) -> bool:
-        """Set the active agent."""
-        if agent_id not in self.agents:
-            logger.error(f"Agent {agent_id} not found")
-            return False
-        
-        # Deactivate current active agent if any
-        if self.active_agent_id and self.active_agent_id in self.agents:
-            self.agents[self.active_agent_id].deactivate()
-        
-        # Activate new agent
-        self.agents[agent_id].activate()
-        self.active_agent_id = agent_id
-        logger.info(f"Set active agent to: {self.agents[agent_id].name} ({agent_id})")
-        return True
-    
-    async def process_message(self, message: str, agent_id: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Process a message with the specified agent or the active agent."""
-        # Determine which agent to use
-        target_agent_id = agent_id or self.active_agent_id
-        
-        if not target_agent_id or target_agent_id not in self.agents:
-            return {"error": "No active agent available"}
-        
-        agent = self.agents[target_agent_id]
-        
-        # Process the message
-        response = await agent.process(message, context)
-        
-        # Check for handoffs
-        handoff = agent.get_next_handoff()
-        if handoff:
-            next_agent_id, handoff_context = handoff
-            
-            if next_agent_id in self.agents:
-                # Set the new agent as active
-                self.set_active_agent(next_agent_id)
-                
-                # Add handoff information to the response
-                response["handoff"] = {
-                    "from_agent": agent.name,
-                    "to_agent": self.agents[next_agent_id].name,
-                    "to_agent_id": next_agent_id
-                }
-                
-                # Process continuation with new agent if requested
-                if handoff_context.get("auto_continue", False):
-                    continuation_response = await self.agents[next_agent_id].process(
-                        "Please continue the conversation based on the context provided.",
-                        handoff_context
-                    )
-                    response["continuation"] = continuation_response
-            else:
-                logger.error(f"Handoff target agent {next_agent_id} not found")
-                response["handoff_error"] = f"Target agent {next_agent_id} not found"
-        
-        return response
-    
-    def unregister_agent(self, agent_id: str) -> bool:
-        """Unregister an agent from the manager."""
-        if agent_id not in self.agents:
-            return False
-        
-        # If this is the active agent, clear active agent
-        if self.active_agent_id == agent_id:
-            self.active_agent_id = None
-        
-        # Remove the agent
-        agent = self.agents.pop(agent_id)
-        agent.deactivate()
-        logger.info(f"Unregistered agent: {agent.name} ({agent.id})")
-        return True
-
-
-# Example specialized agent classes
-
-class ResearcherAgent(LLMAgent):
-    """An agent specialized for research tasks."""
-    
-    def __init__(self, name: str = "Researcher Agent", **kwargs):
-        description = "I specialize in research tasks, including information gathering, analysis, and creating research proposals."
-        super().__init__(name=name, description=description, **kwargs)
-        
-        # Add research-specific system prompt
-        research_prompt = """
-        As a Researcher Agent, your primary role is to help users with scientific research.
-        When responding:
-        1. Break down complex research topics into manageable components
-        2. Cite relevant literature and methodologies 
-        3. Generate hypotheses and suggest experimental designs
-        4. Identify potential limitations and challenges
-        5. Suggest follow-up research directions
+    def reset(self) -> None:
         """
-        self.update_system_prompt(self.system_prompt + research_prompt)
-
-
-class CriticAgent(LLMAgent):
-    """An agent specialized for critique and review."""
-    
-    def __init__(self, name: str = "Critic Agent", **kwargs):
-        description = "I specialize in critical analysis, review, and identifying weaknesses in research proposals."
-        super().__init__(name=name, description=description, **kwargs)
+        Reset the agent to its initial state.
         
-        # Add critic-specific system prompt
-        critic_prompt = """
-        As a Critic Agent, your primary role is to evaluate research proposals and scientific ideas.
-        When responding:
-        1. Identify logical fallacies and methodological weaknesses
-        2. Question assumptions and highlight potential biases
-        3. Suggest alternative approaches or interpretations
-        4. Evaluate the potential impact and novelty
-        5. Provide constructive feedback for improvement
+        This preserves system messages but clears conversation history.
         """
-        self.update_system_prompt(self.system_prompt + critic_prompt)
+        # Keep system messages
+        system_messages = [msg for msg in self.conversation_history if msg.role == MessageRole.SYSTEM]
+        
+        # Clear history and add back system messages
+        self.conversation_history = system_messages.copy()
+        
+        # Reset memory
+        if self.memory_manager:
+            self.memory_manager.clear()
+        
+        # Reset state
+        self.state = AgentState.READY
+        
+        self._emit_event("agent_reset", {
+            "retained_messages": len(system_messages)
+        })
+    
+    def cleanup(self) -> None:
+        """
+        Clean up resources used by the agent.
+        
+        This should be called when the agent is no longer needed.
+        """
+        # Update state
+        self.state = AgentState.TERMINATED
+        
+        # Clear references to external resources
+        self.llm_handler = None
+        self.guardrails = None
+        
+        # Clear memory
+        if self.memory_manager:
+            self.memory_manager.clear()
+            self.memory_manager = None
+        
+        # Clear conversation history
+        self.conversation_history = []
+        
+        # Clear event handlers
+        self.event_handlers = {}
+        
+        self._emit_event("agent_terminated", {})
