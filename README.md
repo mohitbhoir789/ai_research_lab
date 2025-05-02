@@ -77,7 +77,7 @@ PINECONE_INDEX_NAME=your-index-name
 
 ```bash
 cd frontend
-streamlit run app.py
+streamlit run gui.py
 ```
 
 ✅ This will **automatically launch the FastAPI backend** if it's not already running.
