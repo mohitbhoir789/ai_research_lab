@@ -1,42 +1,61 @@
+import sys, os
+import asyncio
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
 """
 Retriever Agent Module
 Specialized agent for retrieving contextual knowledge from various sources.
 """
 
 import logging
-from backend.app.agents.agent_core import LLMAgent
+from backend.app.agents.agent_core import BaseAgent
 from backend.app.utils.embeddings import EmbeddingHandler
 from backend.app.schemas.agent_schemas import RetrieverOutput
+from backend.app.utils.llm import LLMHandler
+from backend.app.utils.guardrails import GuardrailsChecker
 from pinecone import Pinecone
+
 import wikipedia
 import arxiv
 import os
 from dotenv import load_dotenv
 
+import requests
+from io import BytesIO
+from PyPDF2 import PdfReader
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-class RetrieverAgent(LLMAgent):
+class RetrieverAgent(BaseAgent):
     """Agent specialized in retrieving relevant contextual knowledge from static and live sources."""
 
     def __init__(self,
-                 name: str = "Retriever Agent",
-                 model: str = "llama3-70b-8192",
-                 temperature: float = 0.4,
-                 max_tokens: int = 1000,
-                 provider: str = "groq",
+                 llm_handler=None,
+                 guardrails=None,
+                 memory_manager=None,
+                 agent_id=None,
                  **kwargs):
 
-        description = "I specialize in retrieving relevant background context from books, research papers, and the web."
+        
+
+        llm_handler = llm_handler or LLMHandler()
+        guardrails = guardrails or GuardrailsChecker()
+
+        config = {
+            "name": "Retriever Agent",
+            "description": "I specialize in retrieving relevant background context from books, research papers, and the web.",
+            "model": "gemini-2.0-flash",
+            "temperature": 0.4,
+            "max_tokens": 1000,
+            "provider": "gemini"
+        }
 
         super().__init__(
-            name=name,
-            description=description,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            provider=provider,
-            **kwargs
+            llm_handler=llm_handler,
+            guardrails=guardrails,
+            memory_manager=memory_manager,
+            config=config,
+            agent_id=agent_id
         )
 
         # External tools and services
@@ -46,36 +65,49 @@ class RetrieverAgent(LLMAgent):
 
         # Extended system prompt
         specialized_prompt = """
-        As a Retriever Agent, your job is to gather and return accurate and relevant background knowledge.
+        As a Retriever Agent and expert librarian, your role is to curate and provide accurate, well-organized background context on any Computer Science or Data Science topic.
 
-        Your information sources may include:
-        - Retrieved static documents from vector DB (books, papers, etc.)
-        - Wikipedia summaries
-        - Recent academic papers via arXiv
+        You will act like a knowledgeable librarian, drawing from:
+        - Retrieved static documents in the vector database (books, papers, etc.)
+        - Concise Wikipedia summaries
+        - Up-to-date academic papers via arXiv
 
-        Always label each section clearly (e.g., 'Book Context', 'Wikipedia Summary') and avoid assumptions if no data is found.
+        Always:
+        - Label sections clearly (e.g., 'Book Context', 'Paper Context', 'Wikipedia Summary').
+        - Refuse non-Computer Science/Data Science topics (reinforce guardrails).
+        - Avoid making assumptions when data is unavailable; indicate "No X context found."
         """
-        self.update_system_prompt(self.system_prompt + specialized_prompt)
+        # Add specialized prompt to system messages
+        from backend.app.agents.agent_core import MessageRole, Message
+        self.add_message(MessageRole.SYSTEM, specialized_prompt)
 
     async def run(self, query: str) -> str:
         """
-        Unified entry point for the retriever agent. Fetches book, arXiv, and Wikipedia context.
-
-        Args:
-            query: The research topic or question
-
-        Returns:
-            Combined context string
+        Unified entry point for the retriever agent. 
+        Fetches book, paper, and Wikipedia context in order:
+        1. Book from Pinecone
+        2. Paper: first from Pinecone, if not found then from arXiv (and upload)
+        3. Wikipedia summary
         """
+
+        # Step 1: Retrieve book context from Pinecone
         book_context = await self.retrieve_static_context(query, source_type="book")
 
-        if not book_context or len(book_context) < 500:
-            paper_context = await self.fetch_and_store_arxiv(query)
-        else:
-            paper_context = await self.retrieve_static_context(query, source_type="paper")
+        # Step 2: Retrieve paper context from Pinecone
+        paper_context = await self.retrieve_static_context(query, source_type="paper")
 
+        # If no paper context, fetch from arXiv and upload to Pinecone
+        if not paper_context:
+            paper_context, vectors = await self.fetch_and_store_arxiv(query)
+            # Schedule background upsert
+            asyncio.create_task(self._upsert_vectors(vectors))
+        else:
+            vectors = []
+
+        # Step 3: Always fetch Wikipedia summary
         wikipedia_context = self.fetch_wikipedia_summary(query)
 
+        # Combine sections and return
         return f"""## 📘 Book Context
 
 {book_context or "No book context found."}
@@ -150,16 +182,9 @@ class RetrieverAgent(LLMAgent):
             logger.error(f"Wikipedia error: {e}")
             return "⚠️ Error fetching Wikipedia summary."
 
-    async def fetch_and_store_arxiv(self, query: str, max_results: int = 3) -> str:
+    async def fetch_and_store_arxiv(self, query: str, max_results: int = 3) -> tuple[str, list]:
         """
-        Fetch papers from arXiv, embed, and store into Pinecone.
-
-        Args:
-            query: Search query
-            max_results: Max papers to retrieve
-
-        Returns:
-            Combined summary of arXiv results
+        Fetch full PDFs from arXiv, extract text, embed in chunks, and store into Pinecone.
         """
         search = arxiv.Search(
             query=query,
@@ -173,33 +198,45 @@ class RetrieverAgent(LLMAgent):
         try:
             for result in search.results():
                 title = result.title
-                summary = result.summary
                 url = result.entry_id
-                full_text = f"{title}\n\n{summary}"
+                pdf_url = result.pdf_url
 
-                embedding = await self.embedding_handler.embed_query(full_text)
+                # Download PDF
+                resp = requests.get(pdf_url)
+                resp.raise_for_status()
+                reader = PdfReader(BytesIO(resp.content))
 
-                vectors.append({
-                    "id": f"arxiv-{result.entry_id}",
-                    "values": embedding,
-                    "metadata": {
-                        "source_type": "paper",
-                        "source_name": title,
-                        "source_url": url,
-                        "text": summary
-                    }
-                })
+                # Extract full text
+                full_text = ""
+                for page in reader.pages:
+                    full_text += page.extract_text() or ""
 
+                # Chunk text into ~1000 character segments
+                chunk_size = 1000
+                for i in range(0, len(full_text), chunk_size):
+                    chunk = full_text[i:i+chunk_size]
+                    embedding = await self.embedding_handler.embed_query(chunk)
+                    vectors.append({
+                        "id": f"arxiv-{result.entry_id}-chunk-{i//chunk_size}",
+                        "values": embedding,
+                        "metadata": {
+                            "source_type": "paper",
+                            "source_name": title,
+                            "source_url": url,
+                            "chunk_index": i//chunk_size,
+                            "text": chunk[:200]  # store first 200 chars as metadata snippet
+                        }
+                    })
+
+                # For user-facing summary, use abstract
+                summary = result.summary
                 summaries.append(f"- **{title}**\n{summary}\n🔗 {url}\n")
 
-            if vectors:
-                self.index.upsert(vectors=vectors, namespace="default")
-
-            return "\n".join(summaries)
+            return "\n".join(summaries), vectors
 
         except Exception as e:
-            logger.error(f"ArXiv fetch/store failed: {e}")
-            return "⚠️ Error fetching data from arXiv."
+            logger.error(f"ArXiv PDF fetch/store failed: {e}")
+            return "⚠️ Error fetching and storing PDF data from arXiv.", []
 
     async def retrieve_full_context(self, query: str) -> RetrieverOutput:
         """
@@ -223,6 +260,15 @@ class RetrieverAgent(LLMAgent):
             wikipedia_context=wiki
         )
 
+    async def _upsert_vectors(self, vectors):
+        """Background task to upsert embeddings into Pinecone."""
+        try:
+            if vectors:
+                self.index.upsert(vectors=vectors, namespace="default")
+            logger.info("Background upsert to Pinecone completed.")
+        except Exception as e:
+            logger.error(f"Background Pinecone upsert failed: {e}")
+
 
 # For testing the agent directly
 if __name__ == "__main__":
@@ -230,7 +276,8 @@ if __name__ == "__main__":
 
     async def test_agent():
         agent = RetrieverAgent()
-        query = "Transformer neural networks in NLP"
+        query = "what is logistic regression"
+        print("Running retriever agent...")
         result = await agent.run(query)
         print(result)
 

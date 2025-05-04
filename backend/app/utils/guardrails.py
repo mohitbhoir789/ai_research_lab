@@ -22,7 +22,15 @@ class GuardrailsChecker:
 
     def __init__(self):
         # Allowed domain keywords for initial query filtering
-        self.allowed_domains = ["computer science", "data science"]
+        self.allowed_domains = [
+            "computer science",
+            "data science",
+            "machine learning",
+            "artificial intelligence",
+            "ai",
+            "natural language processing",
+            "nlp"
+        ]
         # Example blacklist of disallowed terms (extend as needed)
         self.blacklist = [
             r"\bterrorism\b",

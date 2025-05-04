@@ -13,7 +13,7 @@ from datetime import datetime
 sys.path.append(os.path.join(os.path.dirname(__file__), 'backend'))
 
 # Now imports will work properly
-from scripts.fetch_papers_to_pinecone import fetch_and_upload_arxiv
+from scripts.upload_papers_to_pinecone import fetch_and_upload_arxiv
 from scripts.upload_books_to_pinecone import upload_book_pdf
 
 # Setup Logging
