@@ -23,4 +23,7 @@ env/
 # FastAPI specific
 *.sqlite3
 .pdf
+*.sh
+*.zip
+*.tar.gz
 .sh
