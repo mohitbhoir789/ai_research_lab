@@ -9,7 +9,8 @@ import logging
 from typing import Dict, Any, List, Optional
 import asyncio
 
-from agents.agent_core import AgentManager, BaseAgent, LLMAgent, Memory, Tool
+# Fix import path consistency
+from app.agents.agent_core import AgentManager, BaseAgent, LLMAgent, Memory, Tool
 from app.agents.retriever_agent import RetrieverAgent
 from app.agents.planner_agent import PlannerAgent
 from app.agents.experimental_agent import ExperimentalAgent
@@ -60,26 +61,31 @@ class MCPServer:
 
     def _initialize_agents(self):
         """Initialize and register all specialized agents"""
-        # Initialize specialized agents with the current model and provider
-        self.retriever_agent = RetrieverAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-        self.planner_agent = PlannerAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-        self.experimental_agent = ExperimentalAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-        self.researcher_agent = ResearcherAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-        self.critic_agent = CriticAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-        self.verifier_agent = VerifierAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-        self.summarizer_agent = SummarizerAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
+        try:
+            # Initialize specialized agents with the current model and provider
+            self.retriever_agent = RetrieverAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
+            self.planner_agent = PlannerAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
+            self.experimental_agent = ExperimentalAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
+            self.researcher_agent = ResearcherAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
+            self.critic_agent = CriticAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
+            self.verifier_agent = VerifierAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
+            self.summarizer_agent = SummarizerAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
 
-        # Register all agents with the agent manager
-        self.agent_manager.register_agent(self.retriever_agent)
-        self.agent_manager.register_agent(self.planner_agent)
-        self.agent_manager.register_agent(self.experimental_agent)
-        self.agent_manager.register_agent(self.researcher_agent)
-        self.agent_manager.register_agent(self.critic_agent)
-        self.agent_manager.register_agent(self.verifier_agent)
-        self.agent_manager.register_agent(self.summarizer_agent)
+            # Register all agents with the agent manager
+            self.agent_manager.register_agent(self.retriever_agent)
+            self.agent_manager.register_agent(self.planner_agent)
+            self.agent_manager.register_agent(self.experimental_agent)
+            self.agent_manager.register_agent(self.researcher_agent)
+            self.agent_manager.register_agent(self.critic_agent)
+            self.agent_manager.register_agent(self.verifier_agent)
+            self.agent_manager.register_agent(self.summarizer_agent)
 
-        # Set the researcher agent as the default active agent
-        self.agent_manager.set_active_agent(self.researcher_agent.id)
+            # Set the researcher agent as the default active agent
+            self.agent_manager.set_active_agent(self.researcher_agent.id)
+            
+        except Exception as e:
+            logger.error(f"Error initializing agents: {str(e)}")
+            raise
 
     def update_model_settings(self, model: str, provider: str):
         """
@@ -107,25 +113,32 @@ class MCPServer:
         Returns:
             Session ID (new or existing)
         """
-        if session_id:
-            # Attempt to restore session state
-            session_data = self.memory_manager.load_session(session_id)
-            if session_data:
-                self.global_context = session_data.get("global_context", {})
-                self.session_id = session_id
-                logger.info(f"Resumed existing session: {session_id}")
+        try:
+            if session_id:
+                # Attempt to restore session state
+                session_data = self.memory_manager.load_session(session_id)
+                if session_data:
+                    self.global_context = session_data.get("global_context", {})
+                    self.session_id = session_id
+                    logger.info(f"Resumed existing session: {session_id}")
+                else:
+                    # Create new session if the provided ID doesn't exist
+                    self.session_id = self.memory_manager.create_session()
+                    self.global_context = {}
+                    logger.info(f"Created new session (invalid ID provided): {self.session_id}")
             else:
-                # Create new session if the provided ID doesn't exist
+                # Create new session
                 self.session_id = self.memory_manager.create_session()
                 self.global_context = {}
-                logger.info(f"Created new session (invalid ID provided): {self.session_id}")
-        else:
-            # Create new session
-            self.session_id = self.memory_manager.create_session()
-            self.global_context = {}
-            logger.info(f"Created new session: {self.session_id}")
+                logger.info(f"Created new session: {self.session_id}")
 
-        return self.session_id
+            return self.session_id
+        except Exception as e:
+            logger.error(f"Error in start_session: {str(e)}")
+            # Fallback to a new session ID in case of error
+            self.session_id = f"fallback_{str(int(time.time()))}"
+            self.global_context = {}
+            return self.session_id
 
     async def route(self, user_input: str, session_id: Optional[str] = None, uploaded_files: Optional[List[str]] = None) -> Dict[str, Any]:
         """
@@ -139,94 +152,110 @@ class MCPServer:
         Returns:
             Dict containing trace and final output
         """
-        # Start or resume session
-        if session_id != self.session_id:
-            await self.start_session(session_id)
+        try:
+            # Start or resume session
+            if session_id != self.session_id:
+                await self.start_session(session_id)
 
-        # Reset trace for new request
-        self.trace = []
+            # Reset trace for new request
+            self.trace = []
 
-        # Add user input to global context
-        if "conversation_history" not in self.global_context:
-            self.global_context["conversation_history"] = []
+            # Add user input to global context
+            if "conversation_history" not in self.global_context:
+                self.global_context["conversation_history"] = []
 
-        self.global_context["conversation_history"].append({
-            "role": "user",
-            "content": user_input,
-            "timestamp": self.memory_manager.get_timestamp()
-        })
+            self.global_context["conversation_history"].append({
+                "role": "user",
+                "content": user_input,
+                "timestamp": self.memory_manager.get_timestamp()
+            })
 
-        # Add uploaded files to context if provided
-        if uploaded_files:
-            self.global_context["uploaded_files"] = uploaded_files
-            logger.info(f"Added uploaded files to context: {uploaded_files}")
+            # Add uploaded files to context if provided
+            if uploaded_files:
+                self.global_context["uploaded_files"] = uploaded_files
+                logger.info(f"Added uploaded files to context: {uploaded_files}")
 
-        # Check input guardrails
-        guardrail_check = self.guardrails.check_input(user_input)
-        if not guardrail_check["passed"]:
+            # Check input guardrails
+            guardrail_check = self.guardrails.check_input(user_input)
+            if not guardrail_check["passed"]:
+                return {
+                    "trace": [{
+                        "stage": "guardrails",
+                        "result": "rejected",
+                        "reason": guardrail_check["reason"]
+                    }],
+                    "final_output": guardrail_check["message"],
+                    "session_id": self.session_id
+                }
+
+            # Simple conversational replies
+            greetings = ["hi", "hello", "hey"]
+            farewells = ["bye", "goodbye"]
+            thanks = ["thanks", "thank you"]
+
+            lower_input = user_input.lower().strip()
+            if lower_input in greetings:
+                return {"trace": [{"stage": "conversation", "result": "greeting"}], 
+                        "final_output": "Hello! How can I assist you with your research today?",
+                        "session_id": self.session_id}
+            elif lower_input in farewells:
+                return {"trace": [{"stage": "conversation", "result": "farewell"}], 
+                        "final_output": "Goodbye! Feel free to come back if you have more questions.",
+                        "session_id": self.session_id}
+            elif lower_input in thanks:
+                return {"trace": [{"stage": "conversation", "result": "gratitude"}], 
+                        "final_output": "You're welcome! 😊",
+                        "session_id": self.session_id}
+
+            # Detect user intent to determine appropriate workflow
+            intent = await self.detect_user_intent_llm(user_input)
+
+            # Route to appropriate workflow based on intent
+            if intent == "research":
+                output = await self.research_workflow(user_input)
+            elif intent == "summary":
+                output = await self.summary_workflow(user_input)
+            elif intent == "direct_query":
+                output = await self.direct_query_workflow(user_input)
+            elif intent == "experimental":
+                output = await self.experimental_workflow(user_input)
+            else:
+                # Default to researcher agent for unknown intents
+                output = await self.researcher_agent.run(user_input)
+
+            # Validate and sanitize output
+            output = self.guardrails.sanitize_output(output)
+
+            # Add assistant response to global context
+            self.global_context["conversation_history"].append({
+                "role": "assistant",
+                "content": output,
+                "timestamp": self.memory_manager.get_timestamp()
+            })
+
+            # Save session state
+            self.memory_manager.save_session(self.session_id, {
+                "global_context": self.global_context,
+                "last_trace": self.trace
+            })
+
+            # Log the trace for debugging
+            logger.debug(f"Execution trace: {json.dumps(self.trace, indent=2)}")
+
+            # Return both trace and final output
             return {
-                "trace": [{
-                    "stage": "guardrails",
-                    "result": "rejected",
-                    "reason": guardrail_check["reason"]
-                }],
-                "final_output": guardrail_check["message"]
+                "trace": self.trace,
+                "final_output": output,
+                "session_id": self.session_id
             }
-
-        # Simple conversational replies
-        greetings = ["hi", "hello", "hey"]
-        farewells = ["bye", "goodbye"]
-        thanks = ["thanks", "thank you"]
-
-        lower_input = user_input.lower().strip()
-        if lower_input in greetings:
-            return {"trace": [{"stage": "conversation", "result": "greeting"}], "final_output": "Hello! How can I assist you with your research today?"}
-        elif lower_input in farewells:
-            return {"trace": [{"stage": "conversation", "result": "farewell"}], "final_output": "Goodbye! Feel free to come back if you have more questions."}
-        elif lower_input in thanks:
-            return {"trace": [{"stage": "conversation", "result": "gratitude"}], "final_output": "You're welcome! 😊"}
-
-        # Detect user intent to determine appropriate workflow
-        intent = await self.detect_user_intent_llm(user_input)
-
-        # Route to appropriate workflow based on intent
-        if intent == "research":
-            output = await self.research_workflow(user_input)
-        elif intent == "summary":
-            output = await self.summary_workflow(user_input)
-        elif intent == "direct_query":
-            output = await self.direct_query_workflow(user_input)
-        elif intent == "experimental":
-            output = await self.experimental_workflow(user_input)
-        else:
-            # Default to researcher agent for unknown intents
-            output = await self.researcher_agent.run(user_input)
-
-        # Validate and sanitize output
-        output = self.guardrails.sanitize_output(output)
-
-        # Add assistant response to global context
-        self.global_context["conversation_history"].append({
-            "role": "assistant",
-            "content": output,
-            "timestamp": self.memory_manager.get_timestamp()
-        })
-
-        # Save session state
-        self.memory_manager.save_session(self.session_id, {
-            "global_context": self.global_context,
-            "last_trace": self.trace
-        })
-
-        # Log the trace for debugging
-        logger.debug(f"Execution trace: {json.dumps(self.trace, indent=2)}")
-
-        # Return both trace and final output
-        return {
-            "trace": self.trace,
-            "final_output": output,
-            "session_id": self.session_id
-        }
+        except Exception as e:
+            logger.error(f"Error in route: {str(e)}", exc_info=True)
+            # Provide a fallback response in case of error
+            return {
+                "trace": [{"stage": "error", "error": str(e)}],
+                "final_output": "I encountered an error processing your request. Please try again.",
+                "session_id": self.session_id
+            }
 
     
     async def detect_user_intent_llm(self, user_input: str) -> str:
@@ -239,7 +268,8 @@ class MCPServer:
         Returns:
             Intent as string: "research", "summary", "direct_query", "experimental"
         """
-        prompt = f"""
+        try:
+            prompt = f"""
 Classify the user query into one of these categories:
 
 1. research: If asking for research ideas, experiments, hypothesis, or in-depth research proposals
@@ -251,38 +281,47 @@ Query: "{user_input}"
 
 Respond with exactly one word from the list: research, summary, direct_query, or experimental.
 """
-        response = await self.llm.generate(
-            prompt=prompt,
-            model=self.model,
-            provider=self.provider,
-            temperature=0.3,
-            max_tokens=50
-        )
-        
-        # Normalize the response
-        normalized_response = response.lower().strip()
-        
-        # Map to valid intents
-        if "research" in normalized_response:
-            intent = "research"
-        elif "summary" in normalized_response:
-            intent = "summary"
-        elif "direct" in normalized_response or "query" in normalized_response:
-            intent = "direct_query"
-        elif "experiment" in normalized_response:
-            intent = "experimental"
-        else:
-            # Default to research for unclear responses
-            intent = "research"
-        
-        # Add detection to trace
-        self.trace.append({
-            "stage": "intent_detection",
-            "result": intent,
-            "input": user_input
-        })
-        
-        return intent
+            response = await self.llm.generate(
+                prompt=prompt,
+                model=self.model,
+                provider=self.provider,
+                temperature=0.3,
+                max_tokens=50
+            )
+            
+            # Normalize the response
+            normalized_response = response.lower().strip()
+            
+            # Map to valid intents
+            if "research" in normalized_response:
+                intent = "research"
+            elif "summary" in normalized_response:
+                intent = "summary"
+            elif "direct" in normalized_response or "query" in normalized_response:
+                intent = "direct_query"
+            elif "experiment" in normalized_response:
+                intent = "experimental"
+            else:
+                # Default to research for unclear responses
+                intent = "research"
+            
+            # Add detection to trace
+            self.trace.append({
+                "stage": "intent_detection",
+                "result": intent,
+                "input": user_input
+            })
+            
+            return intent
+        except Exception as e:
+            logger.error(f"Error in intent detection: {str(e)}")
+            # Default to research in case of error
+            self.trace.append({
+                "stage": "intent_detection",
+                "result": "research (default due to error)",
+                "error": str(e)
+            })
+            return "research"
     
     async def research_workflow(self, user_input: str) -> str:
         """
@@ -294,24 +333,25 @@ Respond with exactly one word from the list: research, summary, direct_query, or
         Returns:
             Final research output as a string
         """
-        # Step 1: Retrieve background information
-        retrieved_context = await self.retriever_agent.run(user_input)
-        self.trace.append({
-            "agent": "RetrieverAgent",
-            "action": "Retrieved knowledge",
-            "output": retrieved_context
-        })
-        
-        # Step 2: Create research plan
-        plan = await self.planner_agent.run(user_input)
-        self.trace.append({
-            "agent": "PlannerAgent",
-            "action": "Created research plan",
-            "output": plan
-        })
-        
-        # Step 3: Generate experimental ideas
-        experiment_prompt = f"""
+        try:
+            # Step 1: Retrieve background information
+            retrieved_context = await self.retriever_agent.run(user_input)
+            self.trace.append({
+                "agent": "RetrieverAgent",
+                "action": "Retrieved knowledge",
+                "output": retrieved_context
+            })
+            
+            # Step 2: Create research plan
+            plan = await self.planner_agent.run(user_input)
+            self.trace.append({
+                "agent": "PlannerAgent",
+                "action": "Created research plan",
+                "output": plan
+            })
+            
+            # Step 3: Generate experimental ideas
+            experiment_prompt = f"""
 Query: {user_input}
 
 Background knowledge:
@@ -322,15 +362,15 @@ Research plan:
 
 Based on this information, suggest hypotheses and experiments.
 """
-        experiments = await self.experimental_agent.run(experiment_prompt)
-        self.trace.append({
-            "agent": "ExperimentalAgent",
-            "action": "Generated experimental design",
-            "output": experiments
-        })
-        
-        # Step 4: Create full research proposal
-        proposal_prompt = f"""
+            experiments = await self.experimental_agent.run(experiment_prompt)
+            self.trace.append({
+                "agent": "ExperimentalAgent",
+                "action": "Generated experimental design",
+                "output": experiments
+            })
+            
+            # Step 4: Create full research proposal
+            proposal_prompt = f"""
 Query: {user_input}
 
 Background knowledge:
@@ -344,30 +384,30 @@ Experimental ideas:
 
 Based on all this information, create a complete research proposal.
 """
-        research_proposal = await self.researcher_agent.run(proposal_prompt)
-        self.trace.append({
-            "agent": "ResearcherAgent",
-            "action": "Created full research proposal",
-            "output": research_proposal
-        })
-        
-        # Step 5: Critical review of the proposal
-        critique_prompt = f"""
+            research_proposal = await self.researcher_agent.run(proposal_prompt)
+            self.trace.append({
+                "agent": "ResearcherAgent",
+                "action": "Created full research proposal",
+                "output": research_proposal
+            })
+            
+            # Step 5: Critical review of the proposal
+            critique_prompt = f"""
 Research proposal to review:
 
 {research_proposal}
 
 Provide a critical analysis of this research proposal.
 """
-        critique = await self.critic_agent.run(critique_prompt)
-        self.trace.append({
-            "agent": "CriticAgent",
-            "action": "Provided critical review",
-            "output": critique
-        })
-        
-        # Step 6: Verify facts and feasibility
-        verification_prompt = f"""
+            critique = await self.critic_agent.run(critique_prompt)
+            self.trace.append({
+                "agent": "CriticAgent",
+                "action": "Provided critical review",
+                "output": critique
+            })
+            
+            # Step 6: Verify facts and feasibility
+            verification_prompt = f"""
 Research proposal:
 
 {research_proposal}
@@ -377,15 +417,15 @@ Critique:
 
 Verify the facts, data sources, and overall feasibility of this research proposal.
 """
-        verification = await self.verifier_agent.run(verification_prompt)
-        self.trace.append({
-            "agent": "VerifierAgent",
-            "action": "Verified facts and feasibility",
-            "output": verification
-        })
-        
-        # Step 7: Final academic summary
-        final_prompt = f"""
+            verification = await self.verifier_agent.run(verification_prompt)
+            self.trace.append({
+                "agent": "VerifierAgent",
+                "action": "Verified facts and feasibility",
+                "output": verification
+            })
+            
+            # Step 7: Final academic summary
+            final_prompt = f"""
 # 🧠 Research Proposal
 
 {research_proposal}
@@ -407,15 +447,19 @@ Verify the facts, data sources, and overall feasibility of this research proposa
 Create a comprehensive final academic report that incorporates all the above components.
 Format the output with clear sections and subsections using markdown.
 """
-        final_summary = await self.summarizer_agent.run(final_prompt)
-        self.trace.append({
-            "agent": "SummarizerAgent",
-            "action": "Created final summary",
-            "output": final_summary
-        })
-        
-        # Return the final summary
-        return final_summary
+            final_summary = await self.summarizer_agent.run(final_prompt)
+            self.trace.append({
+                "agent": "SummarizerAgent",
+                "action": "Created final summary",
+                "output": final_summary
+            })
+            
+            # Return the final summary
+            return final_summary
+            
+        except Exception as e:
+            logger.error(f"Error in research workflow: {str(e)}")
+            return f"I encountered an error while researching this topic. Please try a different query or try again later."
     
     async def summary_workflow(self, user_input: str) -> str:
         """
@@ -427,16 +471,17 @@ Format the output with clear sections and subsections using markdown.
         Returns:
             Summarized content as a string
         """
-        # Step 1: Retrieve relevant information
-        retrieved_context = await self.retriever_agent.run(user_input)
-        self.trace.append({
-            "agent": "RetrieverAgent",
-            "action": "Retrieved knowledge",
-            "output": retrieved_context
-        })
-        
-        # Step 2: Generate summary
-        summary_prompt = f"""
+        try:
+            # Step 1: Retrieve relevant information
+            retrieved_context = await self.retriever_agent.run(user_input)
+            self.trace.append({
+                "agent": "RetrieverAgent",
+                "action": "Retrieved knowledge",
+                "output": retrieved_context
+            })
+            
+            # Step 2: Generate summary
+            summary_prompt = f"""
 Query: {user_input}
 
 Background knowledge:
@@ -445,30 +490,34 @@ Background knowledge:
 Please provide a clear, concise summary based on this information.
 Use markdown formatting for readability.
 """
-        summary = await self.summarizer_agent.run(summary_prompt)
-        self.trace.append({
-            "agent": "SummarizerAgent",
-            "action": "Generated summary",
-            "output": summary
-        })
-        
-        # Step 3: Verify facts in the summary
-        verification_prompt = f"""
+            summary = await self.summarizer_agent.run(summary_prompt)
+            self.trace.append({
+                "agent": "SummarizerAgent",
+                "action": "Generated summary",
+                "output": summary
+            })
+            
+            # Step 3: Verify facts in the summary
+            verification_prompt = f"""
 Summary to verify:
 
 {summary}
 
 Please verify the factual accuracy of this summary and correct any inaccuracies.
 """
-        verified_summary = await self.verifier_agent.run(verification_prompt)
-        self.trace.append({
-            "agent": "VerifierAgent",
-            "action": "Verified summary",
-            "output": verified_summary
-        })
-        
-        # Return the verified summary
-        return verified_summary
+            verified_summary = await self.verifier_agent.run(verification_prompt)
+            self.trace.append({
+                "agent": "VerifierAgent",
+                "action": "Verified summary",
+                "output": verified_summary
+            })
+            
+            # Return the verified summary
+            return verified_summary
+            
+        except Exception as e:
+            logger.error(f"Error in summary workflow: {str(e)}")
+            return f"I encountered an error while generating a summary. Please try a different query or try again later."
     
     async def direct_query_workflow(self, user_input: str) -> str:
         """
@@ -480,16 +529,17 @@ Please verify the factual accuracy of this summary and correct any inaccuracies.
         Returns:
             Answer as a string
         """
-        # Use the researcher agent directly for simple factual queries
-        response = await self.researcher_agent.run(user_input)
-        self.trace.append({
-            "agent": "ResearcherAgent",
-            "action": "Answered direct query",
-            "output": response
-        })
-        
-        # Verify the response
-        verification_prompt = f"""
+        try:
+            # Use the researcher agent directly for simple factual queries
+            response = await self.researcher_agent.run(user_input)
+            self.trace.append({
+                "agent": "ResearcherAgent",
+                "action": "Answered direct query",
+                "output": response
+            })
+            
+            # Verify the response
+            verification_prompt = f"""
 Query: {user_input}
 
 Response:
@@ -498,14 +548,18 @@ Response:
 Please verify the factual accuracy of this response and provide a corrected
 version if necessary. Be concise but thorough.
 """
-        verified_response = await self.verifier_agent.run(verification_prompt)
-        self.trace.append({
-            "agent": "VerifierAgent",
-            "action": "Verified response",
-            "output": verified_response
-        })
-        
-        return verified_response
+            verified_response = await self.verifier_agent.run(verification_prompt)
+            self.trace.append({
+                "agent": "VerifierAgent",
+                "action": "Verified response",
+                "output": verified_response
+            })
+            
+            return verified_response
+            
+        except Exception as e:
+            logger.error(f"Error in direct query workflow: {str(e)}")
+            return f"I encountered an error while answering your question. Please try rephrasing or ask a different question."
     
     async def experimental_workflow(self, user_input: str) -> str:
         """
@@ -517,16 +571,17 @@ version if necessary. Be concise but thorough.
         Returns:
             Experimental design as a string
         """
-        # Step 1: Retrieve background information
-        retrieved_context = await self.retriever_agent.run(user_input)
-        self.trace.append({
-            "agent": "RetrieverAgent",
-            "action": "Retrieved knowledge",
-            "output": retrieved_context
-        })
-        
-        # Step 2: Generate experimental design
-        experiment_prompt = f"""
+        try:
+            # Step 1: Retrieve background information
+            retrieved_context = await self.retriever_agent.run(user_input)
+            self.trace.append({
+                "agent": "RetrieverAgent",
+                "action": "Retrieved knowledge",
+                "output": retrieved_context
+            })
+            
+            # Step 2: Generate experimental design
+            experiment_prompt = f"""
 Query: {user_input}
 
 Background knowledge:
@@ -542,15 +597,15 @@ Please design a detailed experimental protocol including:
 
 Format the output with clear sections using markdown.
 """
-        experiments = await self.experimental_agent.run(experiment_prompt)
-        self.trace.append({
-            "agent": "ExperimentalAgent",
-            "action": "Generated experimental design",
-            "output": experiments
-        })
-        
-        # Step 3: Critical review of the experimental design
-        critique_prompt = f"""
+            experiments = await self.experimental_agent.run(experiment_prompt)
+            self.trace.append({
+                "agent": "ExperimentalAgent",
+                "action": "Generated experimental design",
+                "output": experiments
+            })
+            
+            # Step 3: Critical review of the experimental design
+            critique_prompt = f"""
 Experimental design to review:
 
 {experiments}
@@ -562,15 +617,15 @@ Provide a critical analysis of this experimental design, focusing on:
 4. Feasibility
 5. Ethical considerations
 """
-        critique = await self.critic_agent.run(critique_prompt)
-        self.trace.append({
-            "agent": "CriticAgent",
-            "action": "Provided critical review",
-            "output": critique
-        })
-        
-        # Step 4: Final revised experimental design
-        final_prompt = f"""
+            critique = await self.critic_agent.run(critique_prompt)
+            self.trace.append({
+                "agent": "CriticAgent",
+                "action": "Provided critical review",
+                "output": critique
+            })
+            
+            # Step 4: Final revised experimental design
+            final_prompt = f"""
 # 🧪 Original Experimental Design
 
 {experiments}
@@ -586,14 +641,18 @@ Provide a critical analysis of this experimental design, focusing on:
 Based on the original design and critique, create a revised experimental protocol
 that addresses the identified issues. Format the output with clear sections using markdown.
 """
-        final_design = await self.experimental_agent.run(final_prompt)
-        self.trace.append({
-            "agent": "ExperimentalAgent",
-            "action": "Created final experimental design",
-            "output": final_design
-        })
-        
-        return final_design
+            final_design = await self.experimental_agent.run(final_prompt)
+            self.trace.append({
+                "agent": "ExperimentalAgent",
+                "action": "Created final experimental design",
+                "output": final_design
+            })
+            
+            return final_design
+            
+        except Exception as e:
+            logger.error(f"Error in experimental workflow: {str(e)}")
+            return f"I encountered an error while designing the experiment. Please try a different approach or provide more details."
     
     async def handle_file_upload(self, file_path: str, file_type: str) -> Dict[str, Any]:
         """
@@ -606,41 +665,51 @@ that addresses the identified issues. Format the output with clear sections usin
         Returns:
             Dict containing extraction results
         """
-        # Add file info to global context
-        if "uploaded_files" not in self.global_context:
-            self.global_context["uploaded_files"] = []
-        
-        self.global_context["uploaded_files"].append({
-            "path": file_path,
-            "type": file_type,
-            "timestamp": self.memory_manager.get_timestamp()
-        })
-        
-        # Process file based on type
-        # This would integrate with tools that can read PDFs, CSVs, etc.
-        extraction_prompt = f"""
+        try:
+            # Add file info to global context
+            if "uploaded_files" not in self.global_context:
+                self.global_context["uploaded_files"] = []
+            
+            self.global_context["uploaded_files"].append({
+                "path": file_path,
+                "type": file_type,
+                "timestamp": self.memory_manager.get_timestamp()
+            })
+            
+            # Process file based on type
+            # This would integrate with tools that can read PDFs, CSVs, etc.
+            extraction_prompt = f"""
 Analyze the uploaded {file_type} file and extract key information.
 Provide a concise summary of the file contents.
 """
-        
-        # Use the retriever agent to process the file
-        # In a real implementation, this would involve a tool that can read the file
-        summary = await self.retriever_agent.run(extraction_prompt)
-        
-        result = {
-            "file_path": file_path,
-            "file_type": file_type,
-            "summary": summary
-        }
-        
-        # Add to trace
-        self.trace.append({
-            "stage": "file_processing",
-            "file_type": file_type,
-            "result": "processed"
-        })
-        
-        return result
+            
+            # Use the retriever agent to process the file
+            # In a real implementation, this would involve a tool that can read the file
+            summary = await self.retriever_agent.run(extraction_prompt)
+            
+            result = {
+                "file_path": file_path,
+                "file_type": file_type,
+                "summary": summary
+            }
+            
+            # Add to trace
+            self.trace.append({
+                "stage": "file_processing",
+                "file_type": file_type,
+                "result": "processed"
+            })
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing file: {str(e)}")
+            return {
+                "file_path": file_path,
+                "file_type": file_type,
+                "error": str(e),
+                "summary": "Failed to process file"
+            }
     
     def list_sessions(self) -> List[Dict[str, Any]]:
         """
@@ -649,7 +718,11 @@ Provide a concise summary of the file contents.
         Returns:
             List of session information dictionaries
         """
-        return self.memory_manager.list_sessions()
+        try:
+            return self.memory_manager.list_sessions()
+        except Exception as e:
+            logger.error(f"Error listing sessions: {str(e)}")
+            return []
     
     def delete_session(self, session_id: str) -> bool:
         """
@@ -661,12 +734,16 @@ Provide a concise summary of the file contents.
         Returns:
             Boolean indicating success
         """
-        # Clear current session if it's the one being deleted
-        if session_id == self.session_id:
-            self.session_id = None
-            self.global_context = {}
-        
-        return self.memory_manager.delete_session(session_id)
+        try:
+            # Clear current session if it's the one being deleted
+            if session_id == self.session_id:
+                self.session_id = None
+                self.global_context = {}
+            
+            return self.memory_manager.delete_session(session_id)
+        except Exception as e:
+            logger.error(f"Error deleting session: {str(e)}")
+            return False
     
     def get_agents_info(self) -> List[Dict[str, Any]]:
         """
@@ -675,7 +752,11 @@ Provide a concise summary of the file contents.
         Returns:
             List of agent information dictionaries
         """
-        return self.agent_manager.list_agents()
+        try:
+            return self.agent_manager.list_agents()
+        except Exception as e:
+            logger.error(f"Error getting agent info: {str(e)}")
+            return []
     
     def set_active_agent(self, agent_id: str) -> bool:
         """
@@ -687,7 +768,11 @@ Provide a concise summary of the file contents.
         Returns:
             Boolean indicating success
         """
-        return self.agent_manager.set_active_agent(agent_id)
+        try:
+            return self.agent_manager.set_active_agent(agent_id)
+        except Exception as e:
+            logger.error(f"Error setting active agent: {str(e)}")
+            return False
     
     async def generate_session_summary(self, session_id: Optional[str] = None) -> str:
         """
@@ -699,31 +784,32 @@ Provide a concise summary of the file contents.
         Returns:
             Summary as a string
         """
-        target_session = session_id or self.session_id
-        
-        if not target_session:
-            return "No active session to summarize."
-        
-        # Load session data
-        session_data = self.memory_manager.load_session(target_session)
-        
-        if not session_data or "global_context" not in session_data:
-            return "Session data not found or empty."
-        
-        # Extract conversation history
-        history = session_data["global_context"].get("conversation_history", [])
-        
-        if not history:
-            return "No conversation history in this session."
-        
-        # Format conversation for summarization
-        conversation = "\n\n".join([
-            f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
-            for msg in history
-        ])
-        
-        # Generate summary
-        summary_prompt = f"""
+        try:
+            target_session = session_id or self.session_id
+            
+            if not target_session:
+                return "No active session to summarize."
+            
+            # Load session data
+            session_data = self.memory_manager.load_session(target_session)
+            
+            if not session_data or "global_context" not in session_data:
+                return "Session data not found or empty."
+            
+            # Extract conversation history
+            history = session_data["global_context"].get("conversation_history", [])
+            
+            if not history:
+                return "No conversation history in this session."
+            
+            # Format conversation for summarization
+            conversation = "\n\n".join([
+                f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+                for msg in history
+            ])
+            
+            # Generate summary
+            summary_prompt = f"""
 Please create a concise summary of the following conversation between a user and an AI research assistant.
 Focus on the main topics discussed, questions asked, and key information provided.
 
@@ -732,15 +818,20 @@ Conversation:
 
 Summary:
 """
-        
-        summary = await self.summarizer_agent.run(summary_prompt)
-        
-        return summary
+            
+            summary = await self.summarizer_agent.run(summary_prompt)
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Error generating session summary: {str(e)}")
+            return "Failed to generate session summary due to an error."
 
 
 # For testing the MCP server directly
 if __name__ == "__main__":
     import asyncio
+    import time  # Added for fallback session ID generation
     
     async def test_mcp():
         mcp = MCPServer()

@@ -4,9 +4,9 @@ Specialized agent for retrieving contextual knowledge from various sources.
 """
 
 import logging
-from app.agents.agent_core import LLMAgent
-from app.utils.embeddings import EmbeddingHandler
-from app.schemas.agent_schemas import RetrieverOutput
+from backend.app.agents.agent_core import LLMAgent
+from backend.app.utils.embeddings import EmbeddingHandler
+from backend.app.schemas.agent_schemas import RetrieverOutput
 from pinecone import Pinecone
 import wikipedia
 import arxiv

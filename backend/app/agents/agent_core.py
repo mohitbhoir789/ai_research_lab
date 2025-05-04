@@ -1,3 +1,5 @@
+#backend/app/agents/agent_core.py
+
 """
 Agent Core Module
 
@@ -18,15 +20,9 @@ import json
 import traceback
 
 from backend.app.utils.llm import LLMHandler
-from backend.app.utils.guardrails import Guardrails, GuardrailsResult
-from backend.app.utils.memory import MemoryManager
-from backend.app.utils.errors import (
-    AgentError, 
-    LLMError, 
-    RateLimitError, 
-    ContextLengthError,
-    GuardrailsError
-)
+from backend.app.utils.guardrails import GuardrailsChecker
+from backend.app.utils.memory_manager import MemoryManager
+from backend.app.utils.errors import GuardrailViolationError, LLMError, MemoryError, CommunicationError, AgentError
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -77,7 +73,7 @@ class BaseAgent:
     def __init__(
         self,
         llm_handler: LLMHandler,
-        guardrails: Guardrails,
+        guardrails: GuardrailsChecker,
         memory_manager: Optional[MemoryManager] = None,
         config: Optional[Dict[str, Any]] = None,
         agent_id: Optional[str] = None
@@ -180,32 +176,27 @@ class BaseAgent:
         
         try:
             # Check input with guardrails
-            guardrails_result = self.guardrails.check_content(user_input, context)
-            if not guardrails_result.passed:
-                return self._handle_guardrails_violation(guardrails_result)
-            
+            input_check = self.guardrails.check_input(user_input)
+            if not input_check["passed"]:
+                return input_check["message"]
+
             # Add user message to history
             self.add_message(MessageRole.USER, user_input, metadata=context)
-            
+
             # Generate response
             response = self._generate_response(user_input, context)
-            
-            # Check response with guardrails
-            response_check = self.guardrails.check_content(response)
-            if not response_check.passed:
-                response = response_check.modified_content or "I apologize, but I cannot provide that information."
-            
+
+            # Sanitize response with guardrails
+            response = self.guardrails.sanitize_output(response)
+
             # Add assistant message to history
             self.add_message(MessageRole.ASSISTANT, response)
-            
-            # Update memory if needed
-            if self.memory_manager:
-                self.memory_manager.add_interaction(user_input, response, context)
-            
+
+
             # Return to ready state
             self.state = AgentState.READY
             return response
-            
+
         except Exception as e:
             # Handle error and return to previous state if appropriate
             error_response = self._handle_error(e)
@@ -245,37 +236,33 @@ class BaseAgent:
                 start_time = time.time()
                 response = self.llm_handler.generate_text(messages, **params)
                 elapsed_time = time.time() - start_time
-                
+
                 self._emit_event("llm_response_received", {
                     "elapsed_time": elapsed_time,
                     "attempt": attempt + 1,
                     "tokens": len(response) // 4  # Rough estimate
                 })
-                
+
                 return response
-                
-            except RateLimitError as e:
-                # Special handling for rate limits
+
+            except LLMError as e:
+                # Retry on LLMError, including rate limit and context length errors
                 if attempt < max_retries - 1:
-                    self._emit_event("rate_limit_retry", {
+                    self._emit_event("llm_error_retry", {
                         "attempt": attempt + 1,
-                        "delay": retry_delay,
                         "error": str(e)
                     })
-                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                    # If the error is context length, try to summarize and refresh messages
+                    if hasattr(e, "is_context_length") and getattr(e, "is_context_length"):
+                        self._emit_event("context_length_exceeded", {
+                            "current_length": len(str(messages)),
+                            "error": str(e)
+                        })
+                        self._summarize_conversation_history()
+                        messages = self._prepare_messages_for_llm()
+                    time.sleep(retry_delay)
                 else:
                     raise
-                    
-            except ContextLengthError as e:
-                # Handle context length issues by summarizing history
-                self._emit_event("context_length_exceeded", {
-                    "current_length": len(str(messages)),
-                    "error": str(e)
-                })
-                
-                self._summarize_conversation_history()
-                messages = self._prepare_messages_for_llm()  # Refresh messages after summarization
-                
             except Exception as e:
                 # Log other errors and retry if possible
                 if attempt < max_retries - 1:
@@ -286,7 +273,7 @@ class BaseAgent:
                     time.sleep(retry_delay)
                 else:
                     raise LLMError(f"Failed to generate response after {max_retries} attempts: {e}")
-        
+
         # Should not reach here, but just in case
         raise LLMError("Failed to generate response")
     
@@ -369,7 +356,7 @@ class BaseAgent:
             # Fall back to simple truncation
             self.conversation_history = system_messages + recent_messages
     
-    def _handle_guardrails_violation(self, result: GuardrailsResult) -> str:
+    def _handle_guardrails_violation(self, result) -> str:
         """
         Handle content that violates guardrails.
         
@@ -430,14 +417,16 @@ class BaseAgent:
         })
         
         # Determine user-facing error message
-        if isinstance(error, RateLimitError):
-            return "I'm currently experiencing high demand. Please try again in a moment."
-        elif isinstance(error, ContextLengthError):
-            return "Our conversation has grown too long. Let's start a new topic."
-        elif isinstance(error, LLMError):
+        if isinstance(error, LLMError):
             return "I'm having trouble generating a response. Let's try something else."
-        elif isinstance(error, GuardrailsError):
+        elif isinstance(error, GuardrailViolationError):
             return "I cannot process that request due to content safety restrictions."
+        elif isinstance(error, AgentError):
+            return str(error)
+        elif isinstance(error, MemoryError):
+            return "I encountered an issue accessing memory. Please try again later."
+        elif isinstance(error, CommunicationError):
+            return "There was a communication issue between modules. Please try again."
         else:
             return "I encountered an unexpected issue. Could you try again or rephrase your request?"
     
@@ -489,7 +478,7 @@ class BaseAgent:
             "state": self.state.value,
             "message_count": len(self.conversation_history),
             "last_message_time": self.conversation_history[-1].timestamp if self.conversation_history else None,
-            "memory_size": self.memory_manager.size if self.memory_manager else 0,
+            "memory_size": len(self.memory_manager.sessions) if self.memory_manager else 0,
             "config": {k: v for k, v in self.config.items() if k not in ["api_key", "system_prompt"]}
         }
     
