@@ -1,6 +1,8 @@
 # frontend/app.py
 import sys
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from backend.app.mcp.mcp_server import MCPServer
 import uuid
 import streamlit as st
 import streamlit.components.v1 as components
@@ -8,12 +10,12 @@ import streamlit_javascript as stjs
 import asyncio
 import nest_asyncio
 from dotenv import load_dotenv
+
+
+
 load_dotenv()
 os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 
-# Add backend/app to the import path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../backend/app")))
-from mcp.mcp_server import MCPServer 
 
 # Configure Streamlit
 st.set_page_config(page_title="AI Research Assistant", layout="wide")
