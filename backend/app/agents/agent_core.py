@@ -1,5 +1,5 @@
 """
-Enhanced Base Agent Core Module
+Agent Core Module
 
 This module provides an improved base agent with:
 - Robust state management

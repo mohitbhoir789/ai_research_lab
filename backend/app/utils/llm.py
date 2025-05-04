@@ -148,7 +148,7 @@ class LLMHandler:
                          [ModelCapability.CODE, ModelCapability.CREATIVITY], 0.7, 8, 7)
             ],
             LLMProvider.GEMINI: [
-                ModelInfo("gemini-pro", LLMProvider.GEMINI, 8192,
+                ModelInfo("gemini-2.0-flash", LLMProvider.GEMINI, 8192,
                          [ModelCapability.REASONING, ModelCapability.CODE], 0.7, 6, 8)
             ]
         }
@@ -545,10 +545,10 @@ class LLMHandler:
             logger.error(f"OpenAI API error: {e}")
             raise
 
-    async def _query_gemini(self, 
-                          messages: List[Dict[str, str]], 
-                          model: str, 
-                          temperature: float, 
+    async def _query_gemini(self,
+                          messages: List[Dict[str, str]],
+                          model: str,
+                          temperature: float,
                           max_tokens: int,
                           stop_sequences: List[str],
                           extra_params: Dict[str, Any],
@@ -556,55 +556,41 @@ class LLMHandler:
                           stream: bool) -> str:
         """Query the Gemini API"""
         try:
-            # Extract system prompt if present
+            # Extract system prompt if present and user content
             system_prompt = None
-            content = None
+            content_parts = []
             for msg in messages:
                 if msg["role"] == "system":
                     system_prompt = msg["content"]
                 elif msg["role"] == "user":
-                    content = msg["content"]
-            
-            # Use system prompt as prefix if it exists
-            if system_prompt and content:
-                content = f"{system_prompt}\n\n{content}"
-            elif not content:
-                content = system_prompt or ""
-            
-            # Build generation config
-            generation_config = {
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-            }
-            
-            # Handle stop sequences (if API supports it)
-            if stop_sequences:
-                generation_config["stop_sequences"] = stop_sequences
-                
-            # Create the Gemini model
-            gemini_model = genai.GenerativeModel(
-                model_name=model,
-                generation_config=generation_config
+                    content_parts.append(msg["content"])
+
+            # Combine user messages into a single prompt
+            prompt = "\n\n".join(content_parts).strip()
+            if system_prompt:
+                prompt = f"{system_prompt}\n\n{prompt}"
+
+            if not prompt:
+                return ""
+
+            # Instantiate the Gemini model by name
+            gemini_model = genai.GenerativeModel(model)
+
+            # Perform synchronous call in a thread with timeout
+            task = asyncio.create_task(
+                asyncio.to_thread(gemini_model.generate_content, prompt)
             )
-            
-            # Create a task with timeout
-            response_task = asyncio.create_task(
-                asyncio.to_thread(gemini_model.generate_content, content)
-            )
-            
             try:
-                # Wait for completion with timeout
-                response = await asyncio.wait_for(response_task, timeout=timeout)
+                response = await asyncio.wait_for(task, timeout=timeout)
                 return response.text
             except asyncio.TimeoutError:
-                # Cancel the task if it times out
-                response_task.cancel()
+                task.cancel()
                 try:
-                    await response_task
+                    await task
                 except asyncio.CancelledError:
                     pass
                 raise TimeoutError(f"Request to Gemini API timed out after {timeout} seconds")
-                
+
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
             raise
@@ -664,5 +650,20 @@ async def example_usage():
     print(f"Metrics: {llm_handler.get_metrics()}")
 
 
+# if __name__ == "__main__":
+#     asyncio.run(example_usage())
+
+# At bottom of llm.py (for quick local sanity test)
 if __name__ == "__main__":
-    asyncio.run(example_usage())
+    import asyncio
+    handler = LLMHandler()
+    print("Providers:", handler.available_providers)
+    async def _test():
+        resp, meta = await handler.generate("Hello world", LLMConfig(
+            model=handler.get_default_model(handler.available_providers[2]),
+            provider=handler.available_providers[2],
+            max_tokens=10
+        ))
+        print("Output:", resp)
+        print("Meta:", meta)
+    asyncio.run(_test())
