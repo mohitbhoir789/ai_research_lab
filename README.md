@@ -24,11 +24,9 @@ An intelligent research assistant powered by LLMs and LangGraph that helps you g
 ai_research_lab/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py             # FastAPI entrypoint
 │   │   ├── agents/             # All agent logic (planner, critic, etc.)
 │   │   ├── mcp/                # MCPServer (LangGraph-style orchestrator)
-│   │   ├── utils/              # Embedding, LLM handler, etc.
-│   │   └── schemas/            # Pydantic types
+│   │   ├── utils/              # Embedding, LLM handler,Guardrails etc.
 ├── frontend/
 │   └── app.py                  # Streamlit app interface
 ├── requirements.txt
