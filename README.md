@@ -17,6 +17,8 @@ An interactive Streamlit-based application for AI-driven research assistance in 
   * **Verifier Agent**: Validates factual accuracy of retrieved or researched content.
   * **Summarizer Agent**: Generates both bullet-point and paragraph summaries from verified content.
   * **Final Output**: Aggregates summarized, validated content for user display.
+  * **Fine-tuner Agent**: Handles PEFT-style workflows for model fine-tuning tasks.
+  * **Intent Detector Agent**: Advanced intent classification for precise agent selection.
 
 * **Guardrails**:
 
@@ -31,10 +33,9 @@ An interactive Streamlit-based application for AI-driven research assistance in 
 
 ```bash
 git clone https://github.com/mohitbhoir789/ai_research_lab.git
-cd ai_research_lab/backend/app
-pip install -e .  # installs backend package
-cd ../../frontend
-pip install -r ../requirements.txt
+cd ai_research_lab
+pip install -e .  # installs the package in development mode
+pip install -r requirements.txt
 ```
 
 ## Configuration
@@ -56,7 +57,7 @@ Start the application:
 
 ```bash
 cd frontend
-streamlit run gui.py
+python app.py
 ```
 
 * **Sessions**: Manage chats via sidebar (create, rename, delete).
@@ -64,30 +65,67 @@ streamlit run gui.py
 * **Query**: Ask your research question within the CS/Data Science domain.
 * **Flow**: The system routes input based on intent and invokes the appropriate agent pipeline:
 
-  * Intent detection ➔ retriever/researcher ➔ verifier ➔ summarizer ➔ final output
+  * Intent Detection Agent → Specialized Agent Selection → Content Processing → Verification → Summarization → User Response
+
+## Enhanced Agent Flow
+
+The updated system now includes a more sophisticated flow:
+
+1. **Intent Detection**: Analyzes user input to determine the type of request
+2. **Agent Selection**: Routes to one or more specialized agents:
+   - **Retriever Agent**: For knowledge-based queries using vector databases
+   - **Researcher Agent**: For academic research with ArXiv integration
+   - **Fine-tuner Agent**: For model customization requests
+   - **Summarizer Agent**: For content condensation and highlighting
+   - **Verifier Agent**: For fact-checking and validation
+3. **Memory Management**: Long-term retention of important information
+4. **Response Generation**: Coherent, verified answers with citations
 
 ## Project Structure
 
 ```
 ai_research_lab/
 ├── backend/app/
-│   ├── agents/            # Agent implementations
-│   ├── mcp/               # MCPServer & transport
-│   ├── utils/             # LLM handler, embeddings, pdf parser, guardrails, errors
-│   └── schemas/           # Pydantic models
-├── frontend/              # Streamlit UI (gui.py)
-├── memory_store/          # Pinecone namespace files
-├── sessions/              # Saved session dumps
-├── uploads/               # Uploaded files metadata
-├── requirements.txt       # Frontend dependencies
-└── setup.py               # Backend package setup
+│   ├── agents/                # Agent implementations
+│   │   ├── agent_core.py      # Base agent class
+│   │   ├── intent_detector_agent.py  # New intent classifier
+│   │   ├── finetuner_agent.py # New fine-tuning agent
+│   │   ├── summarizer_agent.py
+│   │   ├── verifier_agent.py
+│   │   └── ... other agents
+│   ├── mcp/                   # MCPServer & protocol
+│   ├── utils/                 # LLM handler, embeddings, guardrails, memory
+│   └── schemas/               # Pydantic models
+├── frontend/                  # Frontend application (app.py)
+├── memory_store/              # Memory persistence
+├── sessions/                  # Session management
+├── tests/                     # Test suite
+│   ├── conftest.py            # Test configuration
+│   ├── run_tests.py           # Test runner
+│   └── unit/                  # Unit tests by component
+├── requirements.txt           # Dependencies
+└── setup.py                   # Package configuration
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+python tests/run_tests.py
+```
+
+Or using pytest directly:
+
+```bash
+pytest tests/
 ```
 
 ## Development
 
 * **Add New Agents**: Extend `LLMAgent` in `backend/app/agents` and register in `MCPServer._initialize_agents()`.
 * **Guardrails**: Update logic in `utils/guardrails.py` for allowed topics, unsafe inputs, or toxic outputs.
-* **Fine-Tuning**: Add `FinetunerAgent` for PEFT-style workflows using Hugging Face tools.
+* **Fine-Tuning**: Use the `FinetunerAgent` for PEFT-style workflows using Hugging Face tools.
 * **Advanced Orchestration**: Optionally integrate LangGraph for branching multi-agent control flows.
 
 ## Contribution
