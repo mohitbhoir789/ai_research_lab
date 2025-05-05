@@ -63,7 +63,7 @@ Respond using markdown formatting. If additional context is needed, clearly note
             A structured verification report.
         """
         # Guardrails input validation
-        check = self.guardrails.check_input(content_to_verify)
+        check = await self.guardrails.check_input(content_to_verify)
         if not check["passed"]:
             return f"🚫 Input rejected: {check['reason']}"
 

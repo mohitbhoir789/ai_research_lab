@@ -1,674 +1,413 @@
-# backend/app/utils/llm.py
+"""
+LLM Handler Module
+Unified interface for multiple LLM providers with retry and failover mechanisms.
+"""
+
 import os
-import asyncio
-import logging
 import time
-from enum import Enum, auto
-from typing import Dict, Any, Optional, Tuple, List, Callable
-from dataclasses import dataclass, field
+import asyncio
+from enum import Enum
+from typing import Dict, Any, Optional, Tuple, List
+import logging
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Import provider SDKs
+from groq import AsyncGroq
+from openai import AsyncOpenAI
+import google.generativeai as genai
 
-# Setup logger
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Import LLM clients
-try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
-except ImportError:
-    logger.warning("Groq package not available")
-    GROQ_AVAILABLE = False
-
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except ImportError:
-    logger.warning("OpenAI package not available")
-    OPENAI_AVAILABLE = False
-
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    logger.warning("Google Generative AI package not available")
-    GEMINI_AVAILABLE = False
-
-
-# Initialize clients if possible
-groq_client = None
-if GROQ_AVAILABLE and os.getenv("GROQ_API_KEY"):
-    groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-openai_client = None
-if OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY"):
-    openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    
-if GEMINI_AVAILABLE and os.getenv("GEMINI_API_KEY"):
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-
 class LLMProvider(str, Enum):
-    """Supported LLM providers"""
     GROQ = "groq"
     OPENAI = "openai"
     GEMINI = "gemini"
-    
-    @classmethod
-    def from_string(cls, provider_str: str) -> 'LLMProvider':
-        """Convert string to enum value with validation"""
-        try:
-            return cls(provider_str.lower())
-        except ValueError:
-            logger.warning(f"Unknown provider '{provider_str}', defaulting to OPENAI")
-            return cls.OPENAI
 
-
-class ModelCapability(Enum):
-    """Capabilities that models might have"""
-    CODE = auto()           # Strong at code generation
-    REASONING = auto()      # Strong at logical reasoning
-    CREATIVITY = auto()     # Good for creative content
-    MATH = auto()           # Good at mathematical reasoning
-    KNOWLEDGE = auto()      # Has extensive knowledge
-
-
-@dataclass
-class ModelInfo:
-    """Information about an LLM model"""
-    name: str
-    provider: LLMProvider
-    max_tokens: int
-    capabilities: List[ModelCapability] = field(default_factory=list)
-    suggested_temperature: float = 0.7
-    relative_speed: int = 5  # 1-10 scale, 10 being fastest
-    relative_quality: int = 5  # 1-10 scale, 10 being highest quality
-
-
-@dataclass
 class LLMConfig:
-    """Configuration for LLM requests"""
-    model: str
-    provider: LLMProvider
-    temperature: float = 0.7
-    max_tokens: int = 1000
-    retry_attempts: int = 3
-    retry_delay: float = 1.0  # seconds
-    timeout: float = 30.0  # seconds
-    stream: bool = False
-    system_prompt: Optional[str] = None
-    stop_sequences: List[str] = field(default_factory=list)
-    extra_params: Dict[str, Any] = field(default_factory=dict)
-
-
-class LLMError(Exception):
-    """Base exception for LLM-related errors"""
-    pass
-
-
-class ProviderError(LLMError):
-    """Exception raised when a provider API fails"""
-    def __init__(self, provider: LLMProvider, original_error: Exception):
-        self.provider = provider
-        self.original_error = original_error
-        super().__init__(f"{provider.value.upper()} Error: {str(original_error)}")
-
-
-class ModelNotAvailableError(LLMError):
-    """Exception raised when a model is not available"""
-    def __init__(self, model: str, provider: LLMProvider):
+    """Configuration for LLM requests."""
+    
+    def __init__(
+        self,
+        model: str,
+        provider: LLMProvider,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        top_p: float = 1.0,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        system_instruction: Optional[str] = None
+    ):
         self.model = model
         self.provider = provider
-        super().__init__(f"Model {model} not available for provider {provider.value}")
-
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.presence_penalty = presence_penalty
+        self.frequency_penalty = frequency_penalty
+        self.system_instruction = system_instruction
 
 class LLMHandler:
-    """Enhanced handler for LLM requests with failover, retries, and metrics"""
+    """Unified interface for multiple LLM providers with retry and failover."""
     
-    def __init__(self, default_provider: LLMProvider = LLMProvider.OPENAI):
-        self.default_provider = default_provider
+    def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
+        """Initialize LLM clients for each provider."""
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         
-        # Map of provider to available models
+        # Initialize clients
+        self.groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+        self.openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
+        # Configure Gemini
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        
+        # Provider-specific model mappings
         self.model_mappings = {
-            LLMProvider.GROQ: [
-                ModelInfo("llama-3.3-70b-versatile", LLMProvider.GROQ, 32768,
-                         [ModelCapability.REASONING, ModelCapability.KNOWLEDGE], 0.7, 6, 7),
-                ModelInfo("llama3-70b-8192", LLMProvider.GROQ, 4096,
-                         [ModelCapability.REASONING, ModelCapability.CODE], 0.7, 7, 8),
-                ModelInfo("llama3-8b-8192", LLMProvider.GROQ, 8192,
-                         [ModelCapability.CODE], 0.7, 9, 6)
-            ],
-            LLMProvider.OPENAI: [
-                ModelInfo("gpt-4", LLMProvider.OPENAI, 8192, 
-                         [ModelCapability.REASONING, ModelCapability.CODE, 
-                          ModelCapability.KNOWLEDGE, ModelCapability.MATH], 0.7, 5, 9),
-                ModelInfo("gpt-3.5-turbo", LLMProvider.OPENAI, 4096,
-                         [ModelCapability.CODE, ModelCapability.CREATIVITY], 0.7, 8, 7)
-            ],
-            LLMProvider.GEMINI: [
-                ModelInfo("gemini-2.0-flash", LLMProvider.GEMINI, 8192,
-                         [ModelCapability.REASONING, ModelCapability.CODE], 0.7, 6, 8)
-            ]
+            LLMProvider.GROQ: {
+                "default": "mixtral-8x7b-32768",
+                "fast": "llama-3.1-8b-instant",
+                "code": "codellama-34b",
+                "guard": "llama-guard-3-8b",
+                "large": "llama-3.3-70b-versatile",
+                "context": "llama3-70b-8192",
+                "small": "gemma2-9b-it"
+            },
+            LLMProvider.OPENAI: {
+                "default": "gpt-4-turbo-preview",
+                "fast": "gpt-3.5-turbo",
+                "code": "gpt-4-turbo-preview",
+                "large": "gpt-4-1106-preview"
+            },
+            LLMProvider.GEMINI: {
+                "default": "gemini-1.5-flash",
+                "fast": "gemini-1.5-flash",
+                "pro": "gemini-1.5-pro",
+                "large": "gemini-1.5-pro"
+            }
         }
         
-        # Check which providers are actually available
-        self.available_providers = self._get_available_providers()
-        logger.info(f"Available LLM providers: {[p.value for p in self.available_providers]}")
-        
-        # Metrics tracking
-        self.request_count = 0
-        self.error_count = 0
-        self.total_latency = 0.0
-        
-        # Setup callbacks for request events
-        self.pre_request_callbacks: List[Callable] = []
-        self.post_request_callbacks: List[Callable] = []
-        self.error_callbacks: List[Callable] = []
-        
-    def _get_available_providers(self) -> List[LLMProvider]:
-        """Check which providers are actually available based on clients and API keys"""
-        available = []
-        
-        if GROQ_AVAILABLE and groq_client:
-            available.append(LLMProvider.GROQ)
-            
-        if OPENAI_AVAILABLE and openai_client:
-            available.append(LLMProvider.OPENAI)
-            
-        if GEMINI_AVAILABLE and os.getenv("GEMINI_API_KEY"):
-            available.append(LLMProvider.GEMINI)
-            
-        return available
-        
-    def register_callback(self, event_type: str, callback: Callable):
-        """
-        Register a callback for request events
-        
-        Args:
-            event_type: 'pre_request', 'post_request', or 'error'
-            callback: Function to call on event
-        """
-        if event_type == 'pre_request':
-            self.pre_request_callbacks.append(callback)
-        elif event_type == 'post_request':
-            self.post_request_callbacks.append(callback)
-        elif event_type == 'error':
-            self.error_callbacks.append(callback)
-        else:
-            logger.warning(f"Unknown event type: {event_type}")
-    
-    def get_default_model(self, provider: LLMProvider) -> str:
-        """Get the default model for a provider"""
-        provider_models = self.model_mappings.get(provider, [])
-        if not provider_models:
-            raise ValueError(f"No models available for provider {provider.value}")
-        return provider_models[0].name
+        # Track provider availability
+        self.provider_available = {
+            LLMProvider.GROQ: True,
+            LLMProvider.OPENAI: True,
+            LLMProvider.GEMINI: True
+        }
 
-    def get_model_info(self, model_name: str, provider: LLMProvider) -> Optional[ModelInfo]:
-        """Get information about a specific model"""
-        provider_models = self.model_mappings.get(provider, [])
-        for model_info in provider_models:
-            if model_info.name == model_name:
-                return model_info
-        return None
-    
-    def find_model_by_capability(self, capability: ModelCapability, 
-                                prefer_provider: Optional[LLMProvider] = None) -> ModelInfo:
+    async def generate(
+        self,
+        prompt: Optional[str] = None,
+        config: LLMConfig = None,
+        extra_params: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, Dict[str, Any]]:
         """
-        Find the best model with a specific capability
+        Generate text using the specified LLM provider with retry and failover.
         
         Args:
-            capability: The capability to look for
-            prefer_provider: Optional preferred provider
+            prompt: Text prompt (if not using chat format)
+            config: LLM configuration
+            extra_params: Additional provider-specific parameters (e.g., messages for chat)
             
         Returns:
-            Best matching model info
+            Tuple of (generated text, metadata)
         """
-        candidates = []
+        config = config or LLMConfig(
+            model=self.model_mappings[LLMProvider.GROQ]["default"],
+            provider=LLMProvider.GROQ
+        )
         
-        # First check preferred provider if specified
-        if prefer_provider:
-            for model in self.model_mappings.get(prefer_provider, []):
-                if capability in model.capabilities:
-                    candidates.append(model)
-            
-            if candidates:
-                # Sort by quality and return the best
-                candidates.sort(key=lambda m: m.relative_quality, reverse=True)
-                return candidates[0]
+        extra_params = extra_params or {}
         
-        # If no preferred provider or no matches found, check all providers
-        for provider, models in self.model_mappings.items():
-            if provider in self.available_providers:
-                for model in models:
-                    if capability in model.capabilities:
-                        candidates.append(model)
-        
-        if not candidates:
-            raise ValueError(f"No models found with capability {capability}")
-            
-        # Sort by quality and return the best
-        candidates.sort(key=lambda m: m.relative_quality, reverse=True)
-        return candidates[0]
-        
-    async def generate(self, 
-                      prompt: str, 
-                      config: Optional[LLMConfig] = None,
-                      failover: bool = True) -> Tuple[str, Dict[str, Any]]:
-        """
-        Generate text from a prompt with the specified provider
-        
-        Args:
-            prompt: The input prompt
-            config: LLM configuration (or use defaults)
-            failover: Whether to try alternative providers on failure
-            
-        Returns:
-            Tuple of (generated_text, metadata)
-        """
-        if not config:
-            provider = self.default_provider if self.default_provider in self.available_providers else self.available_providers[0]
-            config = LLMConfig(
-                model=self.get_default_model(provider),
-                provider=provider
+        # If the configured provider is known to be unavailable, try failover immediately
+        if not self.provider_available[config.provider]:
+            logger.warning(f"Provider {config.provider} is known to be unavailable, trying failover immediately")
+            return await self._failover_generation(
+                prompt, config, extra_params, 
+                Exception(f"Provider {config.provider} is marked as unavailable")
             )
-        
-        # Increment request counter
-        self.request_count += 1
-        
-        metadata = {
-            "request_id": self.request_count,
-            "provider": config.provider.value,
-            "model": config.model,
-            "temperature": config.temperature,
-            "max_tokens": config.max_tokens,
-            "attempts": 0,
-            "start_time": time.time()
-        }
-        
-        # Validate provider availability
-        if config.provider not in self.available_providers:
-            logger.warning(f"Requested provider {config.provider.value} not available")
-            if failover:
-                logger.info(f"Falling back to available provider: {self.available_providers[0].value}")
-                config.provider = self.available_providers[0]
-                config.model = self.get_default_model(config.provider)
-                metadata["provider"] = config.provider.value
-                metadata["model"] = config.model
-                metadata["fallback_reason"] = "provider_not_available"
-            else:
-                error_msg = f"Provider {config.provider.value} not available and failover disabled"
-                metadata["success"] = False
-                metadata["error"] = error_msg
-                metadata["duration"] = time.time() - metadata["start_time"]
-                return error_msg, metadata
-        
-        # Trigger pre-request callbacks
-        for callback in self.pre_request_callbacks:
+            
+        # Try primary provider
+        for attempt in range(self.max_retries):
             try:
-                callback(prompt=prompt, config=config, metadata=metadata)
-            except Exception as e:
-                logger.error(f"Error in pre-request callback: {str(e)}")
-        
-        # Try primary provider with retries
-        last_error = None
-        for attempt in range(config.retry_attempts):
-            metadata["attempts"] += 1
-            try:
-                result = await self._call_provider(
-                    prompt, 
-                    config.provider, 
-                    config.model, 
-                    config.temperature, 
-                    config.max_tokens,
-                    config.system_prompt,
-                    config.stop_sequences,
-                    config.extra_params,
-                    config.timeout,
-                    config.stream
+                return await self._generate_with_provider(
+                    prompt, config, extra_params
                 )
-                metadata["success"] = True
-                metadata["duration"] = time.time() - metadata["start_time"]
-                
-                # Trigger post-request callbacks
-                for callback in self.post_request_callbacks:
-                    try:
-                        callback(prompt=prompt, result=result, metadata=metadata)
-                    except Exception as e:
-                        logger.error(f"Error in post-request callback: {str(e)}")
-                
-                # Update metrics
-                self.total_latency += metadata["duration"]
-                
-                return result, metadata
             except Exception as e:
-                last_error = e
-                logger.warning(f"Provider {config.provider.value} attempt {attempt+1} failed: {str(e)}")
+                logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+                    continue
                 
-                # Trigger error callbacks
-                for callback in self.error_callbacks:
-                    try:
-                        callback(prompt=prompt, error=e, metadata=metadata)
-                    except Exception as e:
-                        logger.error(f"Error in error callback: {str(e)}")
+                # Mark the provider as unavailable for future requests
+                self.provider_available[config.provider] = False
+                logger.warning(f"Marked provider {config.provider} as unavailable")
                 
-                if attempt < config.retry_attempts - 1:
-                    # Use exponential backoff
-                    backoff_time = config.retry_delay * (2 ** attempt)
-                    logger.info(f"Retrying in {backoff_time:.2f} seconds...")
-                    await asyncio.sleep(backoff_time)
+                # Try failover to different provider
+                return await self._failover_generation(
+                    prompt, config, extra_params, original_error=e
+                )
+
+    async def _generate_with_provider(
+        self,
+        prompt: Optional[str],
+        config: LLMConfig,
+        extra_params: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate text using a specific provider."""
         
-        # If primary provider failed and failover is enabled, try alternatives
-        if failover:
-            backup_providers = [p for p in self.available_providers if p != config.provider]
-            for provider in backup_providers:
-                try:
-                    logger.info(f"Trying failover provider: {provider.value}")
-                    model = self.get_default_model(provider)
-                    metadata["failover_attempt"] = True
-                    metadata["failover_provider"] = provider.value
-                    metadata["failover_model"] = model
-                    
-                    result = await self._call_provider(
-                        prompt, 
-                        provider, 
-                        model, 
-                        config.temperature, 
-                        config.max_tokens,
-                        config.system_prompt,
-                        config.stop_sequences,
-                        config.extra_params,
-                        config.timeout,
-                        config.stream
-                    )
-                    metadata["success"] = True
-                    metadata["duration"] = time.time() - metadata["start_time"]
-                    
-                    # Trigger post-request callbacks
-                    for callback in self.post_request_callbacks:
-                        try:
-                            callback(prompt=prompt, result=result, metadata=metadata)
-                        except Exception as e:
-                            logger.error(f"Error in post-request callback: {str(e)}")
-                    
-                    # Update metrics
-                    self.total_latency += metadata["duration"]
-                    
-                    return result, metadata
-                except Exception as e:
-                    logger.warning(f"Failover provider {provider.value} failed: {str(e)}")
-        
-        # If we get here, all attempts failed
-        self.error_count += 1
-        metadata["success"] = False
-        metadata["duration"] = time.time() - metadata["start_time"]
-        error_msg = f"All LLM providers failed to generate a response after {metadata['attempts']} attempts"
-        metadata["error"] = error_msg if not last_error else f"{error_msg}. Last error: {str(last_error)}"
-        
-        logger.error(error_msg)
-        return error_msg, metadata
-
-    async def _call_provider(self, 
-                           prompt: str, 
-                           provider: LLMProvider, 
-                           model: str,
-                           temperature: float, 
-                           max_tokens: int,
-                           system_prompt: Optional[str],
-                           stop_sequences: List[str],
-                           extra_params: Dict[str, Any],
-                           timeout: float,
-                           stream: bool) -> str:
-        """Call the appropriate provider method based on the provider type"""
-        try:
-            # Create message structure based on whether system prompt is provided
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
-            
-            if provider == LLMProvider.GROQ:
-                if not GROQ_AVAILABLE or not groq_client:
-                    raise ProviderError(provider, ValueError("Groq client not available"))
-                return await self._query_groq(messages, model, temperature, max_tokens, stop_sequences, extra_params, timeout, stream)
-            
-            elif provider == LLMProvider.OPENAI:
-                if not OPENAI_AVAILABLE or not openai_client:
-                    raise ProviderError(provider, ValueError("OpenAI client not available"))
-                return await self._query_openai(messages, model, temperature, max_tokens, stop_sequences, extra_params, timeout, stream)
-            
-            elif provider == LLMProvider.GEMINI:
-                if not GEMINI_AVAILABLE:
-                    raise ProviderError(provider, ValueError("Gemini client not available"))
-                return await self._query_gemini(messages, model, temperature, max_tokens, stop_sequences, extra_params, timeout, stream)
-            
-            else:
-                raise ValueError(f"Unsupported provider: {provider.value}")
-        except Exception as e:
-            raise ProviderError(provider, e)
-
-    async def _query_groq(self, 
-                        messages: List[Dict[str, str]], 
-                        model: str, 
-                        temperature: float, 
-                        max_tokens: int,
-                        stop_sequences: List[str],
-                        extra_params: Dict[str, Any],
-                        timeout: float,
-                        stream: bool) -> str:
-        """Query the Groq API"""
-        try:
-            # Build request parameters
-            params = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            
-            # Add stop sequences if provided
-            if stop_sequences:
-                params["stop"] = stop_sequences
-                
-            # Add any extra parameters
-            params.update(extra_params)
-            
-            # Create a task with timeout
-            completion_task = asyncio.create_task(
-                asyncio.to_thread(groq_client.chat.completions.create, **params)
-            )
-            
-            try:
-                # Wait for completion with timeout
-                completion = await asyncio.wait_for(completion_task, timeout=timeout)
-                return completion.choices[0].message.content
-            except asyncio.TimeoutError:
-                # Cancel the task if it times out
-                completion_task.cancel()
-                try:
-                    await completion_task
-                except asyncio.CancelledError:
-                    pass
-                raise TimeoutError(f"Request to Groq API timed out after {timeout} seconds")
-                
-        except Exception as e:
-            logger.error(f"Groq API error: {e}")
-            raise
-
-    async def _query_openai(self, 
-                          messages: List[Dict[str, str]], 
-                          model: str, 
-                          temperature: float, 
-                          max_tokens: int,
-                          stop_sequences: List[str],
-                          extra_params: Dict[str, Any],
-                          timeout: float,
-                          stream: bool) -> str:
-        """Query the OpenAI API"""
-        try:
-            # Build request parameters
-            params = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            
-            # Add stop sequences if provided
-            if stop_sequences:
-                params["stop"] = stop_sequences
-                
-            # Add any extra parameters
-            params.update(extra_params)
-            
-            # Create a task with timeout
-            completion_task = asyncio.create_task(
-                asyncio.to_thread(openai_client.chat.completions.create, **params)
-            )
-            
-            try:
-                # Wait for completion with timeout
-                completion = await asyncio.wait_for(completion_task, timeout=timeout)
-                return completion.choices[0].message.content
-            except asyncio.TimeoutError:
-                # Cancel the task if it times out
-                completion_task.cancel()
-                try:
-                    await completion_task
-                except asyncio.CancelledError:
-                    pass
-                raise TimeoutError(f"Request to OpenAI API timed out after {timeout} seconds")
-                
-        except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
-            raise
-
-    async def _query_gemini(self,
-                          messages: List[Dict[str, str]],
-                          model: str,
-                          temperature: float,
-                          max_tokens: int,
-                          stop_sequences: List[str],
-                          extra_params: Dict[str, Any],
-                          timeout: float,
-                          stream: bool) -> str:
-        """Query the Gemini API"""
-        try:
-            # Extract system prompt if present and user content
-            system_prompt = None
-            content_parts = []
-            for msg in messages:
-                if msg["role"] == "system":
-                    system_prompt = msg["content"]
-                elif msg["role"] == "user":
-                    content_parts.append(msg["content"])
-
-            # Combine user messages into a single prompt
-            prompt = "\n\n".join(content_parts).strip()
-            if system_prompt:
-                prompt = f"{system_prompt}\n\n{prompt}"
-
-            if not prompt:
-                return ""
-
-            # Instantiate the Gemini model by name
-            gemini_model = genai.GenerativeModel(model)
-
-            # Perform synchronous call in a thread with timeout
-            task = asyncio.create_task(
-                asyncio.to_thread(gemini_model.generate_content, prompt)
-            )
-            try:
-                response = await asyncio.wait_for(task, timeout=timeout)
-                return response.text
-            except asyncio.TimeoutError:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                raise TimeoutError(f"Request to Gemini API timed out after {timeout} seconds")
-
-        except Exception as e:
-            logger.error(f"Gemini API error: {e}")
-            raise
-            
-    def get_metrics(self) -> Dict[str, Any]:
-        """Get current metrics for the LLM handler"""
-        if self.request_count > 0:
-            avg_latency = self.total_latency / self.request_count
-            error_rate = (self.error_count / self.request_count) * 100
+        if config.provider == LLMProvider.GROQ:
+            return await self._generate_groq(prompt, config, extra_params)
+        elif config.provider == LLMProvider.OPENAI:
+            return await self._generate_openai(prompt, config, extra_params)
+        elif config.provider == LLMProvider.GEMINI:
+            return await self._generate_gemini(prompt, config, extra_params)
         else:
-            avg_latency = 0.0
-            error_rate = 0.0
-            
-        return {
-            "total_requests": self.request_count,
-            "error_count": self.error_count,
-            "error_rate": error_rate,
-            "average_latency": avg_latency,
-            "available_providers": [p.value for p in self.available_providers]
-        }
+            raise ValueError(f"Unsupported provider: {config.provider}")
+
+    async def _generate_groq(
+        self,
+        prompt: Optional[str],
+        config: LLMConfig,
+        extra_params: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate text using Groq."""
         
-    def reset_metrics(self):
-        """Reset metric counters"""
-        self.request_count = 0
-        self.error_count = 0
-        self.total_latency = 0.0
+        try:
+            if "messages" in extra_params:
+                # Chat completion
+                response = await self.groq_client.chat.completions.create(
+                    model=config.model,
+                    messages=extra_params["messages"],
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens or 2000,
+                    top_p=config.top_p
+                )
+                return response.choices[0].message.content, {
+                    "provider": "groq",
+                    "model": config.model,
+                    "finish_reason": response.choices[0].finish_reason
+                }
+            else:
+                # For text completion, we'll use chat interface with a user message
+                # as Groq doesn't have a completions endpoint
+                messages = [{"role": "user", "content": prompt or ""}]
+                response = await self.groq_client.chat.completions.create(
+                    model=config.model,
+                    messages=messages,
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens or 2000,
+                    top_p=config.top_p
+                )
+                return response.choices[0].message.content, {
+                    "provider": "groq",
+                    "model": config.model,
+                    "finish_reason": response.choices[0].finish_reason
+                }
+        except Exception as e:
+            logger.error(f"Groq generation error: {str(e)}")
+            raise
 
-
-# Example usage
-async def example_usage():
-    # Create the handler
-    llm_handler = LLMHandler()
-    
-    # Basic request with defaults
-    response, metadata = await llm_handler.generate("Tell me about quantum computing.")
-    print(f"Response: {response[:100]}...")
-    print(f"Metadata: {metadata}")
-    
-    # Request with specific configuration
-    config = LLMConfig(
-        model="gpt-4",
-        provider=LLMProvider.OPENAI,
-        temperature=0.2,
-        max_tokens=500,
-        system_prompt="You are a helpful expert in physics."
-    )
-    
-    response, metadata = await llm_handler.generate(
-        "Explain the double-slit experiment.", 
-        config=config
-    )
-    
-    print(f"Response: {response[:100]}...")
-    print(f"Metadata: {metadata}")
-    
-    # Print metrics
-    print(f"Metrics: {llm_handler.get_metrics()}")
-
-
-# At bottom of llm.py (for quick local sanity test)
-if __name__ == "__main__":
-    import asyncio
-    handler = LLMHandler()
-    print("Providers:", handler.available_providers)
-    async def _test():
-        if not handler.available_providers:
-            print("No LLM providers available. Please check your API keys.")
-            return
-            
-        # Use first available provider 
-        first_provider = handler.available_providers[2]
-        print(f"Testing with provider: {first_provider.value}")
+    async def _generate_openai(
+        self,
+        prompt: Optional[str],
+        config: LLMConfig,
+        extra_params: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate text using OpenAI."""
         
-        resp, meta = await handler.generate("Hello world", LLMConfig(
-            model=handler.get_default_model(first_provider),
-            provider=first_provider,
-            max_tokens=10
-        ))
-        print("Output:", resp)
-        print("Meta:", meta)
-    asyncio.run(_test())
+        try:
+            if "messages" in extra_params:
+                # Chat completion
+                response = await self.openai_client.chat.completions.create(
+                    model=config.model,
+                    messages=extra_params["messages"],
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens or 2000,
+                    top_p=config.top_p,
+                    presence_penalty=config.presence_penalty,
+                    frequency_penalty=config.frequency_penalty
+                )
+                return response.choices[0].message.content, {
+                    "provider": "openai",
+                    "model": config.model,
+                    "finish_reason": response.choices[0].finish_reason
+                }
+            else:
+                # For new OpenAI API, use chat interface as legacy completions are deprecated
+                messages = [{"role": "user", "content": prompt or ""}]
+                response = await self.openai_client.chat.completions.create(
+                    model=config.model,
+                    messages=messages,
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens or 2000,
+                    top_p=config.top_p,
+                    presence_penalty=config.presence_penalty,
+                    frequency_penalty=config.frequency_penalty
+                )
+                return response.choices[0].message.content, {
+                    "provider": "openai",
+                    "model": config.model,
+                    "finish_reason": response.choices[0].finish_reason
+                }
+        except Exception as e:
+            logger.error(f"OpenAI generation error: {str(e)}")
+            raise
+
+    async def _generate_gemini(
+        self,
+        prompt: Optional[str],
+        config: LLMConfig,
+        extra_params: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate text using Google's Gemini."""
+        
+        try:
+            # Prepare system instruction if available
+            system_instruction = config.system_instruction or None
+            
+            # Set up generation parameters
+            generation_config = {
+                "temperature": config.temperature,
+                "top_p": config.top_p,
+                "max_output_tokens": config.max_tokens or 2000
+            }
+            
+            # Handle messages vs direct prompt
+            if "messages" in extra_params:
+                # Format messages for Gemini API
+                gemini_messages = []
+                for msg in extra_params["messages"]:
+                    if msg.get("role") == "user":
+                        gemini_messages.append({"role": "user", "parts": [{"text": msg.get("content", "")}]})
+                    elif msg.get("role") == "assistant":
+                        gemini_messages.append({"role": "model", "parts": [{"text": msg.get("content", "")}]})
+                    # System message is handled separately in gemini API
+                    elif msg.get("role") == "system" and not system_instruction:
+                        system_instruction = msg.get("content", "")
+                
+                # Initialize Gemini model
+                model = genai.GenerativeModel(
+                    model_name=config.model,
+                    generation_config=generation_config,
+                    system_instruction=system_instruction
+                )
+                
+                # Create a chat session
+                chat = model.start_chat()
+                
+                # Send the conversation history and get response
+                response = await asyncio.to_thread(
+                    chat.send_message, 
+                    gemini_messages[-1]["parts"][0]["text"] if gemini_messages else "Hello"
+                )
+            else:
+                # Direct text completion
+                model = genai.GenerativeModel(
+                    model_name=config.model,
+                    generation_config=generation_config,
+                    system_instruction=system_instruction
+                )
+                
+                # Generate content
+                response = await asyncio.to_thread(
+                    model.generate_content,
+                    prompt or ""
+                )
+            
+            # Extract text from response
+            if hasattr(response, 'text'):
+                result_text = response.text
+            else:
+                result_text = response.candidates[0].content.parts[0].text
+                
+            return result_text, {
+                "provider": "gemini",
+                "model": config.model,
+                "finish_reason": "stop"  # Gemini doesn't provide this info directly
+            }
+        except Exception as e:
+            logger.error(f"Gemini generation error: {str(e)}")
+            raise
+
+    async def _failover_generation(
+        self,
+        prompt: Optional[str],
+        config: LLMConfig,
+        extra_params: Dict[str, Any],
+        original_error: Exception
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Try generation with failover providers."""
+        
+        # Define failover order - prioritize by speed and availability
+        failover_providers = []
+        
+        # Add available providers to the failover list
+        for provider in [LLMProvider.OPENAI, LLMProvider.GROQ, LLMProvider.GEMINI]:
+            if provider != config.provider and self.provider_available[provider]:
+                failover_providers.append(provider)
+        
+        # If no providers are available, try all of them one last time
+        if not failover_providers:
+            failover_providers = [p for p in [LLMProvider.OPENAI, LLMProvider.GROQ, LLMProvider.GEMINI] 
+                                if p != config.provider]
+            # Reset availability for this emergency attempt
+            for provider in failover_providers:
+                self.provider_available[provider] = True
+        
+        # Try each failover provider
+        last_error = original_error
+        for provider in failover_providers:
+            try:
+                logger.info(f"Trying failover with provider: {provider}")
+                # Map the model priority (e.g., "default", "fast") to equivalent in failover provider
+                model_priority = self._get_model_priority(config.provider, config.model)
+                failover_model = self.model_mappings[provider].get(
+                    model_priority, 
+                    self.model_mappings[provider]["default"]
+                )
+                
+                failover_config = LLMConfig(
+                    model=failover_model,
+                    provider=provider,
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens,
+                    system_instruction=config.system_instruction
+                )
+                
+                result = await self._generate_with_provider(
+                    prompt, failover_config, extra_params
+                )
+                
+                # If successful, mark the provider as available again
+                self.provider_available[provider] = True
+                
+                return result
+            except Exception as e:
+                logger.warning(f"Failover to {provider} failed: {str(e)}")
+                # Mark this provider as unavailable too
+                self.provider_available[provider] = False
+                last_error = e
+                continue
+        
+        # If all failovers failed, raise the last error
+        raise Exception(
+            f"All providers failed. Original error: {str(original_error)}. "
+            f"Last failover error: {str(last_error)}"
+        )
+    
+    def _get_model_priority(self, provider: LLMProvider, model_name: str) -> str:
+        """Determine the model priority (default, fast, code, etc.) based on the model name"""
+        provider_models = self.model_mappings[provider]
+        for priority, model in provider_models.items():
+            if model == model_name:
+                return priority
+        return "default"  # Default fallback
+
+    def _convert_messages_to_prompt(self, messages: List[Dict[str, str]]) -> str:
+        """Convert chat messages to a text prompt for providers that don't support chat."""
+        formatted_messages = []
+        for msg in messages:
+            role = msg["role"].capitalize()
+            content = msg["content"]
+            formatted_messages.append(f"{role}: {content}")
+        return "\n".join(formatted_messages)

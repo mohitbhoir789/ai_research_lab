@@ -26,6 +26,35 @@ env/
 *.sh
 *.zip
 *.tar.gz
-.sh
+
+# Non-core functionality scripts
 /scripts/
 scripts/
+*_experimental.py
+experimental_*.py
+critic_agent.py
+planner_agent.py
+upload_*.py
+upload_*.sh
+
+# Test related artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+test_*.py.bak
+
+# Memory and sessions (which may contain sensitive data)
+/memory_store/*.json
+/sessions/*.json
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+.ipynb_checkpoints/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/

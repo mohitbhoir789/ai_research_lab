@@ -20,7 +20,7 @@ class SummarizerAgent(BaseAgent):
     def __init__(
         self,
         name: str = "Summarizer Agent",
-        model: str = "mixtral-8x7b-32768",  # Updated to use a valid Groq model
+        model: str = "llama3-70b-8192",  # Updated to use a currently supported Groq model
         temperature: float = 0.5,  # Lower temperature for more factual responses
         max_tokens: int = 1500,
         provider: str = "groq",
@@ -88,7 +88,7 @@ class SummarizerAgent(BaseAgent):
         # Process the query through the LLM with optional guardrails
         if self.guardrails:
             # Check input safety first
-            check_result = self.guardrails.check_input(processed_query)
+            check_result = await self.guardrails.check_input(processed_query)
             if not check_result["passed"]:
                 return f"Error: {check_result['message']}"
             
@@ -177,7 +177,7 @@ Focus specifically on these aspects: {focus_str}.
         )
         if self.guardrails:
             # Check input safety first
-            check_result = self.guardrails.check_input(prompt)
+            check_result = await self.guardrails.check_input(prompt)
             if not check_result["passed"]:
                 return f"Error: {check_result['message']}"
             
@@ -228,7 +228,7 @@ Provide a structured comparative summary using markdown formatting."""
         
         if self.guardrails:
             # Check input safety first
-            check_result = self.guardrails.check_input(prompt)
+            check_result = await self.guardrails.check_input(prompt)
             if not check_result["passed"]:
                 return f"Error: {check_result['message']}"
             
