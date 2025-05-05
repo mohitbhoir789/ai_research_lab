@@ -4,8 +4,10 @@ Specialized agent for validating claims, checking factual accuracy, and assessin
 """
 
 import logging
-from app.agents.agent_core import LLMAgent
-from app.utils.guardrails import GuardRailsChecker
+from backend.app.agents.agent_core import LLMAgent
+from backend.app.utils.guardrails import GuardrailsChecker
+from backend.app.utils.llm import LLMConfig, LLMProvider
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -14,27 +16,12 @@ class VerifierAgent(LLMAgent):
     """Agent specialized in verifying the factual, logical, and practical validity of research outputs."""
 
     def __init__(self,
-                 name: str = "Verifier Agent",
                  model: str = "llama3-70b-8192",
+                 provider: str = "groq",
+                 agent_id: Optional[str] = None,
                  temperature: float = 0.3,
                  max_tokens: int = 1200,
-                 provider: str = "groq",
                  **kwargs):
-
-        description = (
-            "I specialize in critically verifying the truthfulness, feasibility, and soundness of research claims, "
-            "data sources, and proposed methodologies."
-        )
-
-        super().__init__(
-            name=name,
-            description=description,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            provider=provider,
-            **kwargs
-        )
 
         specialized_prompt = """
 As a Verifier Agent, you rigorously evaluate information and outputs for:
@@ -53,9 +40,17 @@ When verifying, structure your output with:
 
 Respond using markdown formatting. If additional context is needed, clearly note limitations. Always aim for objective, critical evaluation.
 """
-        self.update_system_prompt(self.system_prompt + specialized_prompt)
+        super().__init__(
+            model=model,
+            provider=provider,
+            agent_id=agent_id,
+            system_prompt=specialized_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
 
-        self.guardrails = GuardRailsChecker()
+        self.guardrails = GuardrailsChecker()
 
     async def run(self, content_to_verify: str) -> str:
         """
@@ -73,8 +68,14 @@ Respond using markdown formatting. If additional context is needed, clearly note
             return f"🚫 Input rejected: {check['reason']}"
 
         prompt = self._preprocess_query(content_to_verify)
-        result = await self.process(prompt)
-        raw_response = result.get("response", "")
+        config = LLMConfig(
+            model=self.model,
+            provider=LLMProvider(self.provider),
+            temperature=self.temperature,
+            max_tokens=self.max_tokens
+        )
+        response, _ = await self.llm.generate(prompt=prompt, config=config)
+        raw_response = response
 
         # Guardrails output sanitization
         return self.guardrails.sanitize_output(self._postprocess_response(raw_response))

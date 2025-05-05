@@ -1,22 +1,19 @@
-import sys, os
-import asyncio
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
 """
 Retriever Agent Module
 Specialized agent for retrieving contextual knowledge from various sources.
 """
-
-import logging
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
+import asyncio
+from backend.app.utils.llm import LLMConfig, LLMProvider
 from backend.app.agents.agent_core import BaseAgent
 from backend.app.utils.embeddings import EmbeddingHandler
-from backend.app.schemas.agent_schemas import RetrieverOutput
 from backend.app.utils.llm import LLMHandler
 from backend.app.utils.guardrails import GuardrailsChecker
+import logging
 from pinecone import Pinecone
-
 import wikipedia
 import arxiv
-import os
 from dotenv import load_dotenv
 
 import requests
@@ -30,32 +27,32 @@ class RetrieverAgent(BaseAgent):
     """Agent specialized in retrieving relevant contextual knowledge from static and live sources."""
 
     def __init__(self,
-                 llm_handler=None,
-                 guardrails=None,
-                 memory_manager=None,
-                 agent_id=None,
+                 model: str = "gemini-2.0-flash",
+                 provider: str = "gemini",
+                 agent_id: str = None,
                  **kwargs):
-
         
+        # Initialize handlers
+        from backend.app.utils.llm import LLMHandler
+        from backend.app.utils.guardrails import GuardrailsChecker
+        
+        self.llm = LLMHandler()
+        self.guardrails = GuardrailsChecker()
+        self.temperature = 0.4
+        self.max_tokens = 1000
 
-        llm_handler = llm_handler or LLMHandler()
-        guardrails = guardrails or GuardrailsChecker()
-
-        config = {
-            "name": "Retriever Agent",
-            "description": "I specialize in retrieving relevant background context from books, research papers, and the web.",
-            "model": "gemini-2.0-flash",
-            "temperature": 0.4,
-            "max_tokens": 1000,
-            "provider": "gemini"
-        }
-
+        # Initialize base agent
         super().__init__(
-            llm_handler=llm_handler,
-            guardrails=guardrails,
-            memory_manager=memory_manager,
-            config=config,
+            model=model,
+            provider=provider,
             agent_id=agent_id
+        )
+
+        self.llm_config = LLMConfig(
+            model=self.model,
+            provider=LLMProvider(self.provider),
+            temperature=self.temperature,
+            max_tokens=self.max_tokens
         )
 
         # External tools and services
@@ -78,8 +75,7 @@ class RetrieverAgent(BaseAgent):
         - Avoid making assumptions when data is unavailable; indicate "No X context found."
         """
         # Add specialized prompt to system messages
-        from backend.app.agents.agent_core import MessageRole, Message
-        self.add_message(MessageRole.SYSTEM, specialized_prompt)
+        self.add_message("system", specialized_prompt)
 
     async def run(self, query: str) -> str:
         """
@@ -107,8 +103,7 @@ class RetrieverAgent(BaseAgent):
         # Step 3: Always fetch Wikipedia summary
         wikipedia_context = self.fetch_wikipedia_summary(query)
 
-        # Combine sections and return
-        return f"""## 📘 Book Context
+        combined_context = f"""## 📘 Book Context
 
 {book_context or "No book context found."}
 
@@ -124,6 +119,12 @@ class RetrieverAgent(BaseAgent):
 
 {wikipedia_context or "No Wikipedia summary available."}
 """
+
+        # Optional: Use LLM to summarize or post-process the combined context
+        # response = await self.llm.generate(combined_context, config=self.llm_config)
+        # return response.text
+
+        return combined_context
 
     async def retrieve_static_context(self, query: str, source_type: str = "book", top_k: int = 5) -> str:
         """
@@ -213,7 +214,7 @@ class RetrieverAgent(BaseAgent):
 
                 # Chunk text into ~1000 character segments
                 chunk_size = 1000
-                for i in range(0, len(full_text), chunk_size):
+                for i in 0, len(full_text), chunk_size:
                     chunk = full_text[i:i+chunk_size]
                     embedding = await self.embedding_handler.embed_query(chunk)
                     vectors.append({
@@ -238,27 +239,27 @@ class RetrieverAgent(BaseAgent):
             logger.error(f"ArXiv PDF fetch/store failed: {e}")
             return "⚠️ Error fetching and storing PDF data from arXiv.", []
 
-    async def retrieve_full_context(self, query: str) -> RetrieverOutput:
-        """
-        Return all sources as structured schema output.
+    # async def retrieve_full_context(self, query: str) -> RetrieverOutput:
+    #     """
+    #     Return all sources as structured schema output.
 
-        Args:
-            query: Search query
+    #     Args:
+    #         query: Search query
 
-        Returns:
-            RetrieverOutput object
-        """
-        book = await self.retrieve_static_context(query, source_type="book")
-        paper = await self.retrieve_static_context(query, source_type="paper")
-        if not paper or len(paper) < 500:
-            paper += await self.fetch_and_store_arxiv(query)
-        wiki = self.fetch_wikipedia_summary(query)
+    #     Returns:
+    #         RetrieverOutput object
+    #     """
+    #     book = await self.retrieve_static_context(query, source_type="book")
+    #     paper = await self.retrieve_static_context(query, source_type="paper")
+    #     if not paper or len(paper) < 500:
+    #         paper += await self.fetch_and_store_arxiv(query)
+    #     wiki = self.fetch_wikipedia_summary(query)
 
-        return RetrieverOutput(
-            book_context=book,
-            paper_context=paper,
-            wikipedia_context=wiki
-        )
+    #     return RetrieverOutput(
+    #         book_context=book,
+    #         paper_context=paper,
+    #         wikipedia_context=wiki
+    #     )
 
     async def _upsert_vectors(self, vectors):
         """Background task to upsert embeddings into Pinecone."""

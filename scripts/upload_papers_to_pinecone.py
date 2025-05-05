@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 from pinecone import Pinecone
 from dotenv import load_dotenv
-from app.utils.embeddings import EmbeddingHandler
+from backend.app.utils.embeddings import EmbeddingHandler
 
 load_dotenv()
 

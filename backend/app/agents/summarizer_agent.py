@@ -1,40 +1,51 @@
+import sys, os
+import asyncio
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
 """
 Summarizer Agent Module
 Specialized agent for summarizing text content while maintaining accuracy and clarity.
 """
 import sys
-from app.agents.agent_core import LLMAgent
+from backend.app.agents.agent_core import BaseAgent
+from backend.app.utils.llm import LLMConfig, LLMProvider
+
 import logging
 from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
-class SummarizerAgent(LLMAgent):
+class SummarizerAgent(BaseAgent):
     """Agent specialized in creating clear, concise, and accurate summaries of content."""
     
-    def __init__(self, 
-                 name: str = "Summarizer Agent", 
-                 model: str = "llama3-70b-8192-versatile",
-                 temperature: float = 0.5,  # Lower temperature for more factual responses
-                 max_tokens: int = 1500,
-                 provider: str = "groq",
-                 guardrails=None,
-                 **kwargs):
+    def __init__(
+        self,
+        name: str = "Summarizer Agent",
+        model: str = "mixtral-8x7b-32768",  # Updated to use a valid Groq model
+        temperature: float = 0.5,  # Lower temperature for more factual responses
+        max_tokens: int = 1500,
+        provider: str = "groq",
+        guardrails=None,
+        memory_manager=None,
+        agent_id=None,
+        **kwargs
+    ):
+        from backend.app.utils.guardrails import GuardrailsChecker
+        from backend.app.utils.llm import LLMHandler
+        from backend.app.mcp.mcp_protocol import MessageRole
         
-        self.guardrails = guardrails
+        self.guardrails = guardrails or GuardrailsChecker()
+        self.llm = LLMHandler()
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.memory_manager = memory_manager
 
-        description = "I am a specialized agent that creates concise and accurate summaries of content while preserving key information."
-        
+        # Initialize base agent
         super().__init__(
-            name=name,
-            description=description,
             model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
             provider=provider,
-            **kwargs
+            agent_id=agent_id
         )
-        
+
         # Add specialized system prompt for the summarizer agent
         specialized_prompt = """
         As a Summarizer Agent, I excel at distilling complex information into clear, concise summaries.
@@ -52,8 +63,7 @@ class SummarizerAgent(LLMAgent):
         content type and the user's specific needs.
         """
         
-        # Update the system prompt with specialized instructions
-        self.update_system_prompt(self.system_prompt + specialized_prompt)
+        self.add_message(MessageRole.SYSTEM, specialized_prompt)
         
     async def run(self, query: str) -> str:
         """
@@ -68,14 +78,29 @@ class SummarizerAgent(LLMAgent):
         # Preprocess the query to enhance summarization quality
         processed_query = self._preprocess_query(query)
         
+        config = LLMConfig(
+            model=self.model,
+            provider=LLMProvider(self.provider),
+            temperature=self.temperature,
+            max_tokens=self.max_tokens
+        )
+        
         # Process the query through the LLM with optional guardrails
         if self.guardrails:
-            async def run_model(text): return (await self.process(text)).get("response", "")
-            guarded_result = await self.guardrails.guarded_chat(processed_query, run_model)
-            final_response = self._postprocess_response(guarded_result["final_output"])
+            # Check input safety first
+            check_result = self.guardrails.check_input(processed_query)
+            if not check_result["passed"]:
+                return f"Error: {check_result['message']}"
+            
+            # Generate response
+            response, _ = await self.llm.generate(prompt=processed_query, config=config)
+            
+            # Sanitize the output
+            sanitized_response = self.guardrails.sanitize_output(response)
+            final_response = self._postprocess_response(sanitized_response)
         else:
-            result = await self.process(processed_query)
-            final_response = self._postprocess_response(result.get("response", ""))
+            response, _ = await self.llm.generate(prompt=processed_query, config=config)
+            final_response = self._postprocess_response(response)
         
         # Return the final summarized response
         return final_response
@@ -144,13 +169,27 @@ Provide the summary in a clear, structured format using markdown headings where 
 Focus specifically on these aspects: {focus_str}.
 
 {content}"""
+        config = LLMConfig(
+            model=self.model,
+            provider=LLMProvider(self.provider),
+            temperature=self.temperature,
+            max_tokens=self.max_tokens
+        )
         if self.guardrails:
-            async def run_model(text): return (await self.process(text)).get("response", "")
-            guarded_result = await self.guardrails.guarded_chat(prompt, run_model)
-            return self._postprocess_response(guarded_result["final_output"])
+            # Check input safety first
+            check_result = self.guardrails.check_input(prompt)
+            if not check_result["passed"]:
+                return f"Error: {check_result['message']}"
+            
+            # Generate response
+            response, _ = await self.llm.generate(prompt=prompt, config=config)
+            
+            # Sanitize the output
+            sanitized_response = self.guardrails.sanitize_output(response)
+            return self._postprocess_response(sanitized_response)
         else:
-            result = await self.process(prompt)
-            return self._postprocess_response(result.get("response", ""))
+            response, _ = await self.llm.generate(prompt=prompt, config=config)
+            return self._postprocess_response(response)
     
     async def compare_and_summarize(self, contents: list, comparison_aspects: list = None) -> str:
         """
@@ -179,13 +218,29 @@ Content 1:
 {formatted_contents}
 
 Provide a structured comparative summary using markdown formatting."""
+        
+        config = LLMConfig(
+            model=self.model,
+            provider=LLMProvider(self.provider),
+            temperature=self.temperature,
+            max_tokens=self.max_tokens
+        )
+        
         if self.guardrails:
-            async def run_model(text): return (await self.process(text)).get("response", "")
-            guarded_result = await self.guardrails.guarded_chat(prompt, run_model)
-            return self._postprocess_response(guarded_result["final_output"])
+            # Check input safety first
+            check_result = self.guardrails.check_input(prompt)
+            if not check_result["passed"]:
+                return f"Error: {check_result['message']}"
+            
+            # Generate response
+            response, _ = await self.llm.generate(prompt=prompt, config=config)
+            
+            # Sanitize the output
+            sanitized_response = self.guardrails.sanitize_output(response)
+            return self._postprocess_response(sanitized_response)
         else:
-            result = await self.process(prompt)
-            return self._postprocess_response(result.get("response", ""))
+            response, _ = await self.llm.generate(prompt=prompt, config=config)
+            return self._postprocess_response(response)
 
 
 # For testing the agent directly

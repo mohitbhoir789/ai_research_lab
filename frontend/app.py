@@ -1,22 +1,15 @@
 # frontend/app.py
 
+import streamlit as st
+st.set_page_config(page_title="AI Research Assistant", layout="wide")
+
 import os
 import sys
 import uuid
 import asyncio
-
-import streamlit as st
 from dotenv import load_dotenv
 import nest_asyncio
-
-# ensure we can import backend modules
 import os, sys
-# instead of .., point at backend/app
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend", "app"))
-sys.path.insert(0, BASE_DIR)
-
-# Import your in‑process MCP server
-from mcp.mcp_server import MCPServer
 
 # Load environment variables (API keys, etc.)
 load_dotenv()
@@ -25,16 +18,17 @@ os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 # Apply nest_asyncio so asyncio.run()/get_event_loop().run_until_complete works inside Streamlit
 nest_asyncio.apply()
 
-# Configure Streamlit
-st.set_page_config(page_title="AI Research Assistant", layout="wide")
-
-# Instantiate a single MCPServer for the app lifetime
-mcp_server = MCPServer()
 
 # === Session State Initialization ===
 if "session_id" not in st.session_state:
+    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend", "app"))
+    sys.path.insert(0, BASE_DIR)
+
+    from mcp.mcp_server import MCPServer
+    st.session_state.mcp_server = MCPServer()
+
     st.session_state.session_id = asyncio.get_event_loop().run_until_complete(
-        mcp_server.start_session()
+        st.session_state.mcp_server.start_session()
     )
 
 if "chats" not in st.session_state:
@@ -71,7 +65,7 @@ with st.sidebar:
     model = st.text_input("Model", value=st.session_state.model)
     if st.button("✅ Update Model"):
         # update both MCPServer and session state
-        mcp_server.update_model_settings(model=model, provider=provider)
+        st.session_state.mcp_server.update_model_settings(model=model, provider=provider)
         st.session_state.provider = provider
         st.session_state.model = model
         st.success(f"Model set to `{model}` with `{provider}`")
@@ -99,7 +93,7 @@ if prompt := st.chat_input("Ask me anything..."):
         with st.spinner("Thinking..."):
             try:
                 resp = asyncio.get_event_loop().run_until_complete(
-                    mcp_server.route(
+                    st.session_state.mcp_server.route(
                         user_input=prompt,
                         session_id=st.session_state.session_id,
                     )

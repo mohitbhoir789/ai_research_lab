@@ -133,12 +133,12 @@ class LLMHandler:
         # Map of provider to available models
         self.model_mappings = {
             LLMProvider.GROQ: [
-                ModelInfo("llama3-70b-8192", LLMProvider.GROQ, 8192, 
+                ModelInfo("llama-3.3-70b-versatile", LLMProvider.GROQ, 32768,
+                         [ModelCapability.REASONING, ModelCapability.KNOWLEDGE], 0.7, 6, 7),
+                ModelInfo("llama3-70b-8192", LLMProvider.GROQ, 4096,
                          [ModelCapability.REASONING, ModelCapability.CODE], 0.7, 7, 8),
                 ModelInfo("llama3-8b-8192", LLMProvider.GROQ, 8192,
-                         [ModelCapability.CODE], 0.7, 9, 6),
-                ModelInfo("mixtral-8x7b-32768", LLMProvider.GROQ, 32768,
-                         [ModelCapability.REASONING, ModelCapability.KNOWLEDGE], 0.7, 6, 7)
+                         [ModelCapability.CODE], 0.7, 9, 6)
             ],
             LLMProvider.OPENAI: [
                 ModelInfo("gpt-4", LLMProvider.OPENAI, 8192, 
@@ -650,18 +650,23 @@ async def example_usage():
     print(f"Metrics: {llm_handler.get_metrics()}")
 
 
-# if __name__ == "__main__":
-#     asyncio.run(example_usage())
-
 # At bottom of llm.py (for quick local sanity test)
 if __name__ == "__main__":
     import asyncio
     handler = LLMHandler()
     print("Providers:", handler.available_providers)
     async def _test():
+        if not handler.available_providers:
+            print("No LLM providers available. Please check your API keys.")
+            return
+            
+        # Use first available provider 
+        first_provider = handler.available_providers[2]
+        print(f"Testing with provider: {first_provider.value}")
+        
         resp, meta = await handler.generate("Hello world", LLMConfig(
-            model=handler.get_default_model(handler.available_providers[2]),
-            provider=handler.available_providers[2],
+            model=handler.get_default_model(first_provider),
+            provider=first_provider,
             max_tokens=10
         ))
         print("Output:", resp)

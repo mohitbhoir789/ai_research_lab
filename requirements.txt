@@ -22,3 +22,11 @@ arxiv
 groq
 google-generativeai
 wikipedia
+transformers
+sentence-transformers
+transformers
+transformers 
+torch
+langchain_huggingface
+
+

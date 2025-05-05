@@ -3,7 +3,9 @@ MCPServer Module
 Main orchestrator for the AI Research Assistant application.
 Handles routing between different specialized agents.
 """
+import sys
 import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 import json
 import logging
 from typing import Dict, Any, List, Optional
@@ -12,15 +14,14 @@ import asyncio
 # Fix import path consistency
 from app.agents.agent_core import AgentManager, BaseAgent, LLMAgent, Memory, Tool
 from app.agents.retriever_agent import RetrieverAgent
-from app.agents.planner_agent import PlannerAgent
-from app.agents.experimental_agent import ExperimentalAgent
+#
 from app.agents.researcher_agent import ResearcherAgent
-from app.agents.critic_agent import CriticAgent
+#
 from app.agents.verifier_agent import VerifierAgent
 from app.agents.summarizer_agent import SummarizerAgent
 from app.utils.llm import LLMHandler
 from app.utils.memory_manager import MemoryManager
-from app.utils.guardrails import GuardRailsChecker
+from app.utils.guardrails import GuardrailsChecker
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class MCPServer:
         self.memory_manager = MemoryManager()
 
         # Initialize guardrails checker
-        self.guardrails = GuardRailsChecker()
+        self.guardrails = GuardrailsChecker()
 
         # Default model and provider
         self.model = model
@@ -63,25 +64,19 @@ class MCPServer:
         """Initialize and register all specialized agents"""
         try:
             # Initialize specialized agents with the current model and provider
-            self.retriever_agent = RetrieverAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-            self.planner_agent = PlannerAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-            self.experimental_agent = ExperimentalAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-            self.researcher_agent = ResearcherAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-            self.critic_agent = CriticAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-            self.verifier_agent = VerifierAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
-            self.summarizer_agent = SummarizerAgent(model=self.model, provider=self.provider, guardrails=self.guardrails)
+            self.retriever_agent = RetrieverAgent(model=self.model, provider=self.provider)
+            self.researcher_agent = ResearcherAgent(model=self.model, provider=self.provider)
+            self.verifier_agent = VerifierAgent(model=self.model, provider=self.provider)
+            self.summarizer_agent = SummarizerAgent(model=self.model, provider=self.provider)
 
             # Register all agents with the agent manager
             self.agent_manager.register_agent(self.retriever_agent)
-            self.agent_manager.register_agent(self.planner_agent)
-            self.agent_manager.register_agent(self.experimental_agent)
             self.agent_manager.register_agent(self.researcher_agent)
-            self.agent_manager.register_agent(self.critic_agent)
             self.agent_manager.register_agent(self.verifier_agent)
             self.agent_manager.register_agent(self.summarizer_agent)
 
             # Set the researcher agent as the default active agent
-            self.agent_manager.set_active_agent(self.researcher_agent.id)
+            self.agent_manager.set_active_agent(self.researcher_agent.agent_id)
             
         except Exception as e:
             logger.error(f"Error initializing agents: {str(e)}")
@@ -217,8 +212,6 @@ class MCPServer:
                 output = await self.summary_workflow(user_input)
             elif intent == "direct_query":
                 output = await self.direct_query_workflow(user_input)
-            elif intent == "experimental":
-                output = await self.experimental_workflow(user_input)
             else:
                 # Default to researcher agent for unknown intents
                 output = await self.researcher_agent.run(user_input)
@@ -281,13 +274,15 @@ Query: "{user_input}"
 
 Respond with exactly one word from the list: research, summary, direct_query, or experimental.
 """
-            response = await self.llm.generate(
-                prompt=prompt,
+            from backend.app.utils.llm import LLMConfig, LLMProvider
+            config = LLMConfig(
                 model=self.model,
-                provider=self.provider,
+                provider=LLMProvider(self.provider),
                 temperature=0.3,
                 max_tokens=50
             )
+            
+            response, _ = await self.llm.generate(prompt=prompt, config=config)
             
             # Normalize the response
             normalized_response = response.lower().strip()
@@ -341,48 +336,15 @@ Respond with exactly one word from the list: research, summary, direct_query, or
                 "action": "Retrieved knowledge",
                 "output": retrieved_context
             })
-            
-            # Step 2: Create research plan
-            plan = await self.planner_agent.run(user_input)
-            self.trace.append({
-                "agent": "PlannerAgent",
-                "action": "Created research plan",
-                "output": plan
-            })
-            
-            # Step 3: Generate experimental ideas
-            experiment_prompt = f"""
-Query: {user_input}
 
-Background knowledge:
-{retrieved_context}
-
-Research plan:
-{plan}
-
-Based on this information, suggest hypotheses and experiments.
-"""
-            experiments = await self.experimental_agent.run(experiment_prompt)
-            self.trace.append({
-                "agent": "ExperimentalAgent",
-                "action": "Generated experimental design",
-                "output": experiments
-            })
-            
-            # Step 4: Create full research proposal
+            # Step 2: Create full research proposal (plan/experiments handled in prompt)
             proposal_prompt = f"""
 Query: {user_input}
 
 Background knowledge:
 {retrieved_context}
 
-Research plan:
-{plan}
-
-Experimental ideas:
-{experiments}
-
-Based on all this information, create a complete research proposal.
+Use the background information above to create a comprehensive research proposal.
 """
             research_proposal = await self.researcher_agent.run(proposal_prompt)
             self.trace.append({
@@ -390,32 +352,14 @@ Based on all this information, create a complete research proposal.
                 "action": "Created full research proposal",
                 "output": research_proposal
             })
-            
-            # Step 5: Critical review of the proposal
-            critique_prompt = f"""
-Research proposal to review:
 
-{research_proposal}
-
-Provide a critical analysis of this research proposal.
-"""
-            critique = await self.critic_agent.run(critique_prompt)
-            self.trace.append({
-                "agent": "CriticAgent",
-                "action": "Provided critical review",
-                "output": critique
-            })
-            
-            # Step 6: Verify facts and feasibility
+            # Step 3: Verify facts and feasibility
             verification_prompt = f"""
 Research proposal:
 
 {research_proposal}
 
-Critique:
-{critique}
-
-Verify the facts, data sources, and overall feasibility of this research proposal.
+Please verify the facts, check feasibility, and briefly mention any risks or gaps.
 """
             verification = await self.verifier_agent.run(verification_prompt)
             self.trace.append({
@@ -423,18 +367,12 @@ Verify the facts, data sources, and overall feasibility of this research proposa
                 "action": "Verified facts and feasibility",
                 "output": verification
             })
-            
-            # Step 7: Final academic summary
+
+            # Step 4: Final academic summary
             final_prompt = f"""
 # 🧠 Research Proposal
 
 {research_proposal}
-
----
-
-# 📝 Critique and Challenges
-
-{critique}
 
 ---
 
@@ -444,8 +382,8 @@ Verify the facts, data sources, and overall feasibility of this research proposa
 
 ---
 
-Create a comprehensive final academic report that incorporates all the above components.
-Format the output with clear sections and subsections using markdown.
+Create a final academic report that integrates the proposal and verification.
+Use markdown with clear sections.
 """
             final_summary = await self.summarizer_agent.run(final_prompt)
             self.trace.append({
@@ -453,10 +391,10 @@ Format the output with clear sections and subsections using markdown.
                 "action": "Created final summary",
                 "output": final_summary
             })
-            
+
             # Return the final summary
             return final_summary
-            
+
         except Exception as e:
             logger.error(f"Error in research workflow: {str(e)}")
             return f"I encountered an error while researching this topic. Please try a different query or try again later."
@@ -561,98 +499,6 @@ version if necessary. Be concise but thorough.
             logger.error(f"Error in direct query workflow: {str(e)}")
             return f"I encountered an error while answering your question. Please try rephrasing or ask a different question."
     
-    async def experimental_workflow(self, user_input: str) -> str:
-        """
-        Workflow for designing experiments
-        
-        Args:
-            user_input: The user's experimental design query
-            
-        Returns:
-            Experimental design as a string
-        """
-        try:
-            # Step 1: Retrieve background information
-            retrieved_context = await self.retriever_agent.run(user_input)
-            self.trace.append({
-                "agent": "RetrieverAgent",
-                "action": "Retrieved knowledge",
-                "output": retrieved_context
-            })
-            
-            # Step 2: Generate experimental design
-            experiment_prompt = f"""
-Query: {user_input}
-
-Background knowledge:
-{retrieved_context}
-
-Please design a detailed experimental protocol including:
-1. Hypothesis
-2. Materials and methods
-3. Experimental setup
-4. Data collection procedures
-5. Analysis methods
-6. Expected outcomes and interpretations
-
-Format the output with clear sections using markdown.
-"""
-            experiments = await self.experimental_agent.run(experiment_prompt)
-            self.trace.append({
-                "agent": "ExperimentalAgent",
-                "action": "Generated experimental design",
-                "output": experiments
-            })
-            
-            # Step 3: Critical review of the experimental design
-            critique_prompt = f"""
-Experimental design to review:
-
-{experiments}
-
-Provide a critical analysis of this experimental design, focusing on:
-1. Scientific rigor
-2. Potential confounding variables
-3. Statistical power
-4. Feasibility
-5. Ethical considerations
-"""
-            critique = await self.critic_agent.run(critique_prompt)
-            self.trace.append({
-                "agent": "CriticAgent",
-                "action": "Provided critical review",
-                "output": critique
-            })
-            
-            # Step 4: Final revised experimental design
-            final_prompt = f"""
-# 🧪 Original Experimental Design
-
-{experiments}
-
----
-
-# 📝 Critique and Challenges
-
-{critique}
-
----
-
-Based on the original design and critique, create a revised experimental protocol
-that addresses the identified issues. Format the output with clear sections using markdown.
-"""
-            final_design = await self.experimental_agent.run(final_prompt)
-            self.trace.append({
-                "agent": "ExperimentalAgent",
-                "action": "Created final experimental design",
-                "output": final_design
-            })
-            
-            return final_design
-            
-        except Exception as e:
-            logger.error(f"Error in experimental workflow: {str(e)}")
-            return f"I encountered an error while designing the experiment. Please try a different approach or provide more details."
     
     async def handle_file_upload(self, file_path: str, file_type: str) -> Dict[str, Any]:
         """
