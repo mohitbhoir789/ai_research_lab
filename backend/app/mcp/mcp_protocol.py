@@ -211,7 +211,7 @@ class MCPProtocolHandler:
         self.logger = logging.getLogger(__name__)
         self.user_query_history = []  # Store only user queries, not responses
         self.max_query_history_length = 10  # Keep only last 10 user queries
-        self.max_query_length = 1000  # Maximum character length for stored queries
+        self.max_query_length = 1000  # Maximum character length for stored queries - reduced from previous value
 
     def add_user_query(self, query: str) -> None:
         """
@@ -258,3 +258,19 @@ class MCPProtocolHandler:
             Total character count
         """
         return sum(len(item["query"]) for item in self.user_query_history)
+        
+    def enforce_query_limit(self, query: str) -> str:
+        """
+        Enforce the character limit on a query
+        
+        Args:
+            query: The original query
+            
+        Returns:
+            The query, potentially truncated to respect character limit
+        """
+        if len(query) > self.max_query_length:
+            truncated = query[:self.max_query_length] + "..."
+            self.logger.warning(f"Query truncated from {len(query)} to {self.max_query_length} characters")
+            return truncated
+        return query

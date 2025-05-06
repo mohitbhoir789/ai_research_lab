@@ -401,6 +401,11 @@ Verify key claims briefly."""
             Dict containing trace and final output
         """
         try:
+            # Enforce 1000 character limit on user input to prevent the "query too long" error
+            if len(user_input) > 1000:
+                user_input = user_input[:1000] + "..."
+                logger.warning("User input truncated to 1000 characters")
+                
             # Start or resume session
             if session_id != self.session_id:
                 await self.start_session(session_id)
@@ -497,6 +502,7 @@ Verify key claims briefly."""
                 }
 
             # Detect intent and validate against guardrails using the IntentDetectorAgent
+            # Ensure we're passing a trimmed user_input to prevent "query too long" errors
             intent_data = await self._run_with_fallback(
                 self.intent_detector.detect_intent,
                 user_input
@@ -536,15 +542,16 @@ Verify key claims briefly."""
             }
             
             # Limit previous queries history size (only store user queries, not full responses)
-            max_queries_to_store = 3
+            # Enforce stricter limits to ensure we stay within the 1000 character total limit
+            max_queries_to_store = 2  # Reduced from 3 to 2 to save space
             if len(self.global_context["conversation_history"]) > max_queries_to_store * 2:  # Multiply by 2 since we store user and minimal response metadata
                 # Keep only the most recent messages (cutting from the beginning)
                 self.global_context["conversation_history"] = self.global_context["conversation_history"][-(max_queries_to_store*2):]
                 
-            # Add user message to history as minimal record (keep only query text, not full context)
+            # Add user message to history with shorter snippets
             self.global_context["conversation_history"].append({
                 "role": "user",
-                "content": user_input[:200] + ("..." if len(user_input) > 200 else ""),  # Only store preview of message
+                "content": user_input[:150] + ("..." if len(user_input) > 150 else ""),  # Reduced from 200 to 150 chars
                 "timestamp": self.memory_manager.get_timestamp(),
             })
 
@@ -599,9 +606,10 @@ Verify key claims briefly."""
 
             # Add minimal record of the response to the conversation history
             # Only store a title/summary of the response, not the full text
+            # Using even shorter snippets to preserve character budget
             self.global_context["conversation_history"].append({
                 "role": "assistant",
-                "content": output[:50] + ("..." if len(output) > 50 else ""),  # Only store short preview
+                "content": output[:30] + ("..." if len(output) > 30 else ""),  # Reduced from 50 to 30 chars
                 "timestamp": self.memory_manager.get_timestamp(),
             })
 

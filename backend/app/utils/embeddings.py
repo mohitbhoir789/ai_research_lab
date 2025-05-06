@@ -21,18 +21,65 @@ class EmbeddingHandler:
     def __init__(
         self,
         model_name: str = "all-mpnet-base-v2",
-        pinecone_index_name: str = None
+        pinecone_index_name: str = None,
+        force_dimension: int = 384
     ):
         """Initialize embedding model and vector store."""
         # Initialize sentence transformer model
         self.model = SentenceTransformer(model_name)
         self.model_name = model_name
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
-
+        
         # Initialize Pinecone
         self.pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
         self.index_name = pinecone_index_name or os.getenv("PINECONE_INDEX_NAME")
         self.index = self.pc.Index(self.index_name)
+        
+        # Get index stats to determine dimension
+        try:
+            index_stats = self.index.describe_index_stats()
+            self.index_dimension = index_stats.get('dimension', self.embedding_dim)
+            logger.info(f"Pinecone index dimension: {self.index_dimension}, Model dimension: {self.embedding_dim}")
+            
+            # If dimensions don't match, we'll need to resize
+            self.need_resize = self.index_dimension != self.embedding_dim
+            
+            # Override with forced dimension if specified
+            if force_dimension is not None:
+                self.index_dimension = force_dimension
+                self.need_resize = self.index_dimension != self.embedding_dim
+                
+        except Exception as e:
+            logger.warning(f"Couldn't fetch index stats: {str(e)}. Using model dimension.")
+            self.index_dimension = self.embedding_dim
+            self.need_resize = False
+
+    def _resize_vector(self, vector: List[float], target_dim: int) -> List[float]:
+        """
+        Resize a vector to match the target dimension.
+        
+        Args:
+            vector: Original embedding vector
+            target_dim: Target dimension
+            
+        Returns:
+            Resized vector
+        """
+        vector = np.array(vector)
+        original_dim = len(vector)
+        
+        # If dimensions already match, return as is
+        if original_dim == target_dim:
+            return vector.tolist()
+            
+        # If target is smaller, truncate
+        if target_dim < original_dim:
+            return vector[:target_dim].tolist()
+            
+        # If target is larger, pad with zeros
+        padded = np.zeros(target_dim)
+        padded[:original_dim] = vector
+        return padded.tolist()
 
     async def embed_query(self, text: str) -> List[float]:
         """
@@ -42,7 +89,7 @@ class EmbeddingHandler:
             text: Text to embed
             
         Returns:
-            List of embedding values
+            List of embedding values, resized if necessary
         """
         try:
             # Run embedding generation in a thread pool to avoid blocking
@@ -51,6 +98,11 @@ class EmbeddingHandler:
                 text,
                 convert_to_numpy=True
             )
+            
+            # Resize if needed
+            if self.need_resize:
+                return self._resize_vector(embedding.tolist(), self.index_dimension)
+            
             return embedding.tolist()
         except Exception as e:
             logger.error(f"Error generating embedding: {str(e)}")
@@ -69,7 +121,7 @@ class EmbeddingHandler:
             batch_size: Number of texts to embed in parallel
             
         Returns:
-            List of embedding vectors
+            List of embedding vectors, resized if necessary
         """
         try:
             all_embeddings = []
@@ -82,7 +134,17 @@ class EmbeddingHandler:
                     batch_size=batch_size,
                     convert_to_numpy=True
                 )
-                all_embeddings.extend(batch_embeddings.tolist())
+                
+                # Resize each embedding if needed
+                if self.need_resize:
+                    batch_embeddings = [
+                        self._resize_vector(emb.tolist(), self.index_dimension) 
+                        for emb in batch_embeddings
+                    ]
+                else:
+                    batch_embeddings = batch_embeddings.tolist()
+                    
+                all_embeddings.extend(batch_embeddings)
             return all_embeddings
         except Exception as e:
             logger.error(f"Error generating batch embeddings: {str(e)}")

@@ -78,10 +78,54 @@ class AgentMemory:
         """Add an agent message to the conversation history."""
         self.conversation.add_message("agent", content, metadata)
     
-    def get_formatted_history(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
-        """Get formatted conversation history suitable for LLM context."""
+    def get_formatted_history(self, limit: Optional[int] = None, max_chars: int = 1000) -> List[Dict[str, str]]:
+        """
+        Get formatted conversation history suitable for LLM context, limited by character count.
+        
+        Args:
+            limit: Optional message count limit
+            max_chars: Maximum total characters allowed (default: 1000)
+            
+        Returns:
+            List of formatted messages, potentially truncated to respect character limit
+        """
         messages = self.conversation.get_history(limit)
-        return [{"role": msg["role"], "content": msg["content"]} for msg in messages]
+        formatted_messages = [{"role": msg["role"], "content": msg["content"]} for msg in messages]
+        
+        # Calculate total characters
+        total_chars = sum(len(msg["content"]) for msg in formatted_messages)
+        
+        # If under limit, return as is
+        if total_chars <= max_chars:
+            return formatted_messages
+            
+        # Otherwise need to trim messages to fit under max_chars
+        result = []
+        char_count = 0
+        
+        # Start from most recent messages (reversed order)
+        for msg in reversed(formatted_messages):
+            content_len = len(msg["content"])
+            
+            # If adding this message would exceed limit, truncate it
+            if char_count + content_len > max_chars:
+                # Calculate remaining space
+                remaining = max_chars - char_count
+                if remaining > 50:  # Only add if we can include meaningful content
+                    truncated_content = msg["content"][:remaining-3] + "..."
+                    result.insert(0, {"role": msg["role"], "content": truncated_content})
+                break
+            
+            # Otherwise add the whole message
+            char_count += content_len
+            result.insert(0, msg)
+            
+            # Stop if we're at the limit
+            if char_count >= max_chars:
+                break
+                
+        logger.debug(f"History truncated from {total_chars} to {char_count} characters")
+        return result
     
     def summarize_memory(self) -> Dict[str, Any]:
         """Summarize the agent's memory for logging or debugging."""

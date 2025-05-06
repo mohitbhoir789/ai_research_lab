@@ -26,7 +26,7 @@ class IntentDetectorAgent(LLMAgent):
     ):
         """Initialize the intent detector agent."""
         
-        system_prompt = """You are an expert Intent Detection AI that determines:
+        self.system_prompt = """You are an expert Intent Detection AI that determines:
 1. The type of query (chat/research)
 2. The depth of response needed (brief/detailed)
 3. Whether it's within allowed domains (Computer Science/Data Science)
@@ -55,7 +55,7 @@ Always respond with a structured output:
             model=model,
             provider=provider,
             agent_id=agent_id or "intent_detector",
-            system_prompt=system_prompt,
+            system_prompt=self.system_prompt,
             temperature=temperature,
             max_tokens=max_tokens
         )

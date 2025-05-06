@@ -203,11 +203,33 @@ class LLMAgent(BaseAgent):
         # Get recent message history (last 10 messages)
         messages = self.conversation_history[-10:]
         
+        # Limit message content to manage context size
+        limited_messages = []
+        total_chars = 0
+        max_history_chars = 1000  # Limit history to 1000 chars
+        
+        # First, add system messages without truncation
+        for msg in messages:
+            if msg["role"] == "system":
+                limited_messages.append({"role": msg["role"], "content": msg["content"]})
+                
+        # Then add user and assistant messages with limits
+        for msg in reversed(messages):  # Start with most recent
+            if msg["role"] != "system":
+                # Truncate message content if needed
+                content_limit = 200  # Max 200 chars per message
+                truncated_content = msg["content"][:content_limit]
+                
+                # Check if adding this message would exceed our total limit
+                if total_chars + len(truncated_content) <= max_history_chars:
+                    limited_messages.insert(0, {"role": msg["role"], "content": truncated_content})
+                    total_chars += len(truncated_content)
+                else:
+                    # We've reached the history char limit
+                    break
+        
         # Format messages for LLM API
-        formatted_messages = [
-            {"role": msg["role"], "content": msg["content"]}
-            for msg in messages
-        ]
+        formatted_messages = limited_messages
         
         from backend.app.utils.llm import LLMConfig, LLMProvider
         config = LLMConfig(
@@ -227,6 +249,7 @@ class LLMAgent(BaseAgent):
             
         except Exception as e:
             logger.error(f"LLM error: {str(e)}")
+            self.last_error = str(e)
             return "I'm having trouble generating a response right now."
 
 

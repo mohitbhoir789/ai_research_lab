@@ -297,8 +297,22 @@ class ResearcherAgent(LLMAgent):
                     max_tokens=self.max_tokens
                 )
                 
-                # Create a research prompt that doesn't depend on conversation history
-                research_prompt = f"""Provide a concise research analysis on: {user_input}
+                # Limit chat history to first 1000 chars
+                limited_history = ""
+                if self.conversation_history:
+                    history_texts = [f"{msg['role']}: {msg['content'][:200]}" 
+                                   for msg in self.conversation_history[-5:]]
+                    limited_history = "\n".join(history_texts)[:1000]
+                
+                # Ensure total context stays under 2000 chars
+                max_query_len = 2000 - len(limited_history) - 200  # 200 chars for prompt template
+                trimmed_query = user_input[:max_query_len] if len(user_input) > max_query_len else user_input
+                
+                # Create a research prompt that uses limited conversation history
+                research_prompt = f"""Provide a concise research analysis on: {trimmed_query}
+
+Context from previous conversation:
+{limited_history}
 
 Include:
 - Key concepts
