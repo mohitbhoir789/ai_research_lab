@@ -58,3 +58,5 @@ test_*.py.bak
 dist/
 build/
 *.egg-info/
+memory_store/
+frontend/sessions/

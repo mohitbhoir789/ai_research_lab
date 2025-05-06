@@ -249,7 +249,7 @@ class ResearcherAgent(LLMAgent):
         self.state = "processing"
         
         try:
-            # Add user message to history
+            # Add user message to history but don't rely on full history for context
             self.add_message("user", user_input)
             
             # Detect intent to determine specialized function
@@ -270,17 +270,10 @@ class ResearcherAgent(LLMAgent):
                 response = await self.suggest_experiments(question)
                 
             elif "limitations" in user_input.lower() and "analyze" in user_input.lower():
-                # Check if we should use previous proposal
-                if "previous" in user_input.lower() and self.conversation_history:
-                    # Find last assistant message
-                    for msg in reversed(self.conversation_history):
-                        if msg["role"] == "assistant":
-                            proposal = msg["content"]
-                            break
-                    else:
-                        proposal = "Please provide a proposal or experiment to analyze"
-                else:
-                    proposal = user_input
+                # Use minimal context for analysis to avoid token limits
+                proposal = user_input.replace("analyze limitations", "").strip()
+                if not proposal or len(proposal) < 50:
+                    proposal = "Please provide a proposal or experiment to analyze"
                 
                 response = await self.analyze_limitations(proposal)
                 
@@ -295,14 +288,28 @@ class ResearcherAgent(LLMAgent):
                 response = await self.suggest_interdisciplinary_approaches(topic)
                 
             else:
-                # Handle as general research question
+                # For general research queries, use a directly focused prompt 
+                # to avoid "too_long" errors
                 config = LLMConfig(
                     model=self.model,
                     provider=LLMProvider(self.provider),
                     temperature=self.temperature,
                     max_tokens=self.max_tokens
                 )
-                response, _ = await self.llm.generate(prompt=user_input, config=config)
+                
+                # Create a research prompt that doesn't depend on conversation history
+                research_prompt = f"""Provide a concise research analysis on: {user_input}
+
+Include:
+- Key concepts
+- Current research state
+- Major methods
+- Key challenges
+- Future directions
+
+Be scientific, objective, and evidence-based."""
+                
+                response, _ = await self.llm.generate(prompt=research_prompt, config=config)
             
             # Apply guardrails if available
             if self.guardrails:

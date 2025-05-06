@@ -149,6 +149,207 @@ class MCPServer:
         # If all fallbacks fail, return the default
         return "groq", "llama3-8b-8192"
 
+    async def _run_with_fallback(self, func, *args, **kwargs):
+        """
+        Run a function with fallback mechanisms if it fails
+        
+        Args:
+            func: The async function to run
+            *args: Arguments to pass to the function
+            **kwargs: Keyword arguments to pass to the function
+            
+        Returns:
+            The result of the function or None if all attempts fail
+        """
+        original_provider = self.provider
+        original_model = self.model
+        
+        # First try with the current provider/model
+        try:
+            result = await func(*args, **kwargs)
+            return result
+        except Exception as e:
+            logger.warning(f"Error with provider {self.provider}: {str(e)}")
+            self.trace.append({
+                "stage": "fallback",
+                "error": str(e),
+                "original_provider": original_provider,
+                "fallback": True
+            })
+            
+            # Get fallback provider and model
+            fallback_provider, fallback_model = self.get_fallback_provider(self.provider)
+            
+            # Try with fallback provider
+            try:
+                # Update model settings to use fallback
+                self.update_model_settings(fallback_model, fallback_provider)
+                
+                # Try again with the new model
+                result = await func(*args, **kwargs)
+                return result
+            except Exception as fallback_error:
+                logger.error(f"Fallback also failed: {str(fallback_error)}")
+                self.trace.append({
+                    "stage": "fallback",
+                    "error": str(fallback_error),
+                    "fallback_provider": fallback_provider,
+                    "fallback_failed": True
+                })
+                
+                # Restore original settings
+                self.update_model_settings(original_model, original_provider)
+                return None
+
+    async def direct_query_workflow(self, user_input: str) -> str:
+        """
+        Simple workflow for brief answers and direct queries
+        
+        Args:
+            user_input: The user's query
+            
+        Returns:
+            Response from the summarizer agent
+        """
+        try:
+            # Use summarizer agent for direct, brief responses
+            response = await self.summarizer_agent.run(user_input)
+            
+            # Add to trace for tracking
+            self.trace.append({
+                "agent": self.summarizer_agent.__class__.__name__,
+                "stage": "direct_response",
+                "success": True
+            })
+            
+            return response
+        except Exception as e:
+            logger.error(f"Error in direct_query_workflow: {str(e)}")
+            self.trace.append({
+                "agent": self.summarizer_agent.__class__.__name__,
+                "stage": "direct_response",
+                "success": False,
+                "error": str(e)
+            })
+            raise
+            
+    async def summary_workflow(self, user_input: str) -> str:
+        """
+        Two-step workflow with retrieval and summarization for detailed answers
+        
+        Args:
+            user_input: The user's query
+            
+        Returns:
+            Response from the summarizer agent with retrieved context
+        """
+        try:
+            # Step 1: Get relevant context from retriever agent
+            retrieved_context = await self.retriever_agent.run(user_input)
+            
+            self.trace.append({
+                "agent": self.retriever_agent.__class__.__name__,
+                "stage": "retrieval",
+                "success": True
+            })
+            
+            # Step 2: Summarize with context
+            enhanced_prompt = f"""
+            QUERY: {user_input}
+            
+            CONTEXT: {retrieved_context}
+            
+            Based on the above context, provide a detailed answer to the query.
+            """
+            
+            response = await self.summarizer_agent.run(enhanced_prompt)
+            
+            self.trace.append({
+                "agent": self.summarizer_agent.__class__.__name__,
+                "stage": "summarization",
+                "success": True
+            })
+            
+            return response
+        except Exception as e:
+            logger.error(f"Error in summary_workflow: {str(e)}")
+            self.trace.append({
+                "stage": "summary_workflow",
+                "success": False,
+                "error": str(e)
+            })
+            raise
+            
+    async def research_workflow(self, user_input: str) -> str:
+        """
+        Advanced workflow with research paper analysis, verification, and summarization
+        
+        Args:
+            user_input: The user's query
+            
+        Returns:
+            Verified and summarized response
+        """
+        try:
+            # Step 1: Get relevant context from retriever agent but limit size
+            retrieved_context = await self.retriever_agent.run(user_input)
+            
+            # Truncate context if it's too long (max 1500 chars)
+            if len(retrieved_context) > 1500:
+                retrieved_context = retrieved_context[:1500] + "...[truncated for brevity]"
+            
+            self.trace.append({
+                "agent": self.retriever_agent.__class__.__name__,
+                "stage": "retrieval",
+                "success": True
+            })
+            
+            # Step 2: Research with retrieved context - use concise prompt structure
+            enhanced_prompt = f"""RESEARCH QUESTION: {user_input}
+CONTEXT: {retrieved_context}
+Provide concise research analysis on the question based on the context."""
+            
+            research_response = await self.researcher_agent.run(enhanced_prompt)
+            
+            self.trace.append({
+                "agent": self.researcher_agent.__class__.__name__,
+                "stage": "research",
+                "success": True
+            })
+            
+            # Skip verification step if research response is too long
+            if len(research_response) > 2000:
+                logger.info("Research response too long, skipping verification")
+                return research_response
+                
+            # Step 3: Verify the research findings with compact prompt
+            verification_prompt = f"""QUESTION: {user_input}
+RESEARCH: {research_response}
+Verify key claims briefly."""
+            
+            verification_result = await self.verifier_agent.run(verification_prompt)
+            
+            self.trace.append({
+                "agent": self.verifier_agent.__class__.__name__,
+                "stage": "verification",
+                "success": True
+            })
+            
+            # Only use verification result if it's not an error
+            if verification_result.lower().startswith("error:"):
+                logger.warning("Verification failed, using original research response")
+                return research_response
+                
+            return verification_result
+        except Exception as e:
+            logger.error(f"Error in research_workflow: {str(e)}")
+            self.trace.append({
+                "stage": "research_workflow",
+                "success": False,
+                "error": str(e)
+            })
+            raise
+
     async def start_session(self, session_id: Optional[str] = None) -> str:
         """
         Start a new session or resume an existing one
@@ -206,25 +407,92 @@ class MCPServer:
 
             # Reset trace for new request
             self.trace = []
-
+            
+            # Ensure we have a conversation history array
+            if "conversation_history" not in self.global_context:
+                self.global_context["conversation_history"] = []
+                
             # Handle simple conversational replies
             lower_input = user_input.lower().strip()
             if lower_input in ["hi", "hello", "hey"]:
+                # Add the greeting to conversation history
+                self.global_context["conversation_history"].append({
+                    "role": "user",
+                    "content": user_input[:200] + ("..." if len(user_input) > 200 else ""),  # Only store preview of message
+                    "timestamp": self.memory_manager.get_timestamp(),
+                })
+                
+                # Add the response to conversation history
+                greeting_response = "Hello! How can I assist you today?"
+                self.global_context["conversation_history"].append({
+                    "role": "assistant",
+                    "content": greeting_response[:100] + ("..." if len(greeting_response) > 100 else ""),
+                    "timestamp": self.memory_manager.get_timestamp(),
+                })
+                
+                # Save session state
+                self.memory_manager.save_session(self.session_id, {
+                    "global_context": self.global_context,
+                    "last_trace": [{"stage": "conversation", "result": "greeting"}]
+                })
+                
                 return {
                     "trace": [{"stage": "conversation", "result": "greeting"}], 
-                    "final_output": "Hello! How can I assist you today?",
+                    "final_output": greeting_response,
                     "session_id": self.session_id
                 }
             elif lower_input in ["bye", "goodbye"]:
+                # Add the farewell to conversation history
+                self.global_context["conversation_history"].append({
+                    "role": "user",
+                    "content": user_input[:200] + ("..." if len(user_input) > 200 else ""),
+                    "timestamp": self.memory_manager.get_timestamp(),
+                })
+                
+                # Add the response to conversation history
+                farewell_response = "Goodbye! Feel free to come back if you have more questions."
+                self.global_context["conversation_history"].append({
+                    "role": "assistant",
+                    "content": farewell_response[:100] + ("..." if len(farewell_response) > 100 else ""),
+                    "timestamp": self.memory_manager.get_timestamp(),
+                })
+                
+                # Save session state
+                self.memory_manager.save_session(self.session_id, {
+                    "global_context": self.global_context,
+                    "last_trace": [{"stage": "conversation", "result": "farewell"}]
+                })
+                
                 return {
                     "trace": [{"stage": "conversation", "result": "farewell"}], 
-                    "final_output": "Goodbye! Feel free to come back if you have more questions.",
+                    "final_output": farewell_response,
                     "session_id": self.session_id
                 }
             elif lower_input in ["thanks", "thank you"]:
+                # Add the thanks to conversation history
+                self.global_context["conversation_history"].append({
+                    "role": "user",
+                    "content": user_input[:200] + ("..." if len(user_input) > 200 else ""),
+                    "timestamp": self.memory_manager.get_timestamp(),
+                })
+                
+                # Add the response to conversation history
+                gratitude_response = "You're welcome! 😊"
+                self.global_context["conversation_history"].append({
+                    "role": "assistant",
+                    "content": gratitude_response[:100] + ("..." if len(gratitude_response) > 100 else ""),
+                    "timestamp": self.memory_manager.get_timestamp(),
+                })
+                
+                # Save session state
+                self.memory_manager.save_session(self.session_id, {
+                    "global_context": self.global_context,
+                    "last_trace": [{"stage": "conversation", "result": "gratitude"}]
+                })
+                
                 return {
                     "trace": [{"stage": "conversation", "result": "gratitude"}], 
-                    "final_output": "You're welcome! 😊",
+                    "final_output": gratitude_response,
                     "session_id": self.session_id
                 }
 
@@ -258,16 +526,26 @@ class MCPServer:
                     "session_id": self.session_id
                 }
 
-            # Add user input to global context
-            if "conversation_history" not in self.global_context:
-                self.global_context["conversation_history"] = []
-
-            self.global_context["conversation_history"].append({
-                "role": "user",
-                "content": user_input,
+            # Add user input to global context - only store minimal metadata and intent
+            # Avoid storing full conversation history to reduce context size
+            self.global_context["latest_query"] = {
+                "content": user_input[:200],  # Only store first 200 chars of the query
                 "timestamp": self.memory_manager.get_timestamp(),
                 "mode": mode,
-                "intent": intent_data
+                "intent_type": intent_data.get("mode", "unknown")
+            }
+            
+            # Limit previous queries history size (only store user queries, not full responses)
+            max_queries_to_store = 3
+            if len(self.global_context["conversation_history"]) > max_queries_to_store * 2:  # Multiply by 2 since we store user and minimal response metadata
+                # Keep only the most recent messages (cutting from the beginning)
+                self.global_context["conversation_history"] = self.global_context["conversation_history"][-(max_queries_to_store*2):]
+                
+            # Add user message to history as minimal record (keep only query text, not full context)
+            self.global_context["conversation_history"].append({
+                "role": "user",
+                "content": user_input[:200] + ("..." if len(user_input) > 200 else ""),  # Only store preview of message
+                "timestamp": self.memory_manager.get_timestamp(),
             })
 
             # Add uploaded files to context if provided
@@ -319,12 +597,12 @@ class MCPServer:
             # Apply guardrails to output
             output = self.guardrails.sanitize_output(output)
 
-            # Add response to global context
+            # Add minimal record of the response to the conversation history
+            # Only store a title/summary of the response, not the full text
             self.global_context["conversation_history"].append({
                 "role": "assistant",
-                "content": output,
+                "content": output[:50] + ("..." if len(output) > 50 else ""),  # Only store short preview
                 "timestamp": self.memory_manager.get_timestamp(),
-                "mode": mode
             })
 
             # Save session state
@@ -346,320 +624,3 @@ class MCPServer:
                 "final_output": "I encountered an error processing your request. Please try again.",
                 "session_id": self.session_id
             }
-
-    async def _run_with_fallback(self, func, *args, **kwargs) -> Optional[Any]:
-        """
-        Run a function with provider fallback if it fails
-        
-        Args:
-            func: The function to run
-            *args, **kwargs: Arguments to pass to the function
-            
-        Returns:
-            The function result or None if all attempts fail
-        """
-        # Try with original provider first
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            logger.warning(f"Function {func.__name__} failed with provider {self.provider}: {str(e)}")
-            
-            # Try with each fallback provider
-            original_provider = self.provider
-            original_model = self.model
-            
-            for fallback_attempt in range(2):  # Try two fallback attempts
-                try:
-                    # Get next fallback provider
-                    fallback_provider, fallback_model = self.get_fallback_provider(self.provider)
-                    
-                    # Log fallback attempt
-                    logger.info(f"Trying fallback to {fallback_provider}/{fallback_model}")
-                    
-                    # Update model settings temporarily 
-                    self.update_model_settings(fallback_model, fallback_provider)
-                    
-                    # Try function with fallback provider
-                    result = await func(*args, **kwargs)
-                    
-                    # If successful, log it
-                    logger.info(f"Fallback to {fallback_provider}/{fallback_model} succeeded")
-                    
-                    # Add to trace
-                    self.trace.append({
-                        "fallback": True,
-                        "original_provider": original_provider,
-                        "new_provider": fallback_provider,
-                        "function": func.__name__
-                    })
-                    
-                    return result
-                except Exception as fallback_e:
-                    logger.warning(f"Fallback {fallback_attempt+1} to {self.provider} failed: {str(fallback_e)}")
-            
-            # If all fallbacks fail, restore original settings
-            self.update_model_settings(original_model, original_provider)
-            
-            # Add failure to trace
-            self.trace.append({
-                "fallback_failed": True,
-                "function": func.__name__,
-                "error": str(e)
-            })
-            
-            return None
-
-    async def direct_query_workflow(self, user_input: str) -> str:
-        """
-        Handle direct query workflow for brief answers in chat mode
-
-        Args:
-            user_input: The user's query
-
-        Returns:
-            Brief response to the query
-        """
-        try:
-            # Use summarizer agent with specific instructions for brief answer
-            config = {
-                "style": "brief",
-                "max_length": 150  # Keep it concise
-            }
-            
-            # Handoff to summarizer agent with reasoning
-            handoff_result = await self.agent_handoff(
-                from_agent_id=self.researcher_agent.agent_id,  # Default agent
-                to_agent_id=self.summarizer_agent.agent_id,
-                reason="Query requires a brief, direct answer with minimal detail",
-                user_input=user_input,
-                context=config
-            )
-            
-            if "error" in handoff_result:
-                logger.error(f"Agent handoff failed: {handoff_result['error']}")
-                # Fallback to direct call if handoff fails
-                return await self.summarizer_agent.run(user_input)
-                
-            return handoff_result["response"]
-            
-        except Exception as e:
-            logger.error(f"Error in direct_query_workflow: {str(e)}")
-            raise  # Let the _run_with_fallback function handle it
-
-    async def summary_workflow(self, user_input: str) -> str:
-        """
-        Handle summary workflow for detailed explanations in chat mode
-
-        Args:
-            user_input: The user's query
-
-        Returns:
-            Detailed explanation response to the query
-        """
-        try:
-            # First handoff to retriever agent to get relevant context
-            retrieval_result = await self.agent_handoff(
-                from_agent_id=self.researcher_agent.agent_id,  # Default agent
-                to_agent_id=self.retriever_agent.agent_id,
-                reason="Query requires relevant context retrieval before generating a detailed explanation",
-                user_input=user_input,
-                context={"task": "retrieval", "mode": "detailed"}
-            )
-            
-            if "error" in retrieval_result:
-                logger.error(f"Retriever agent handoff failed: {retrieval_result['error']}")
-                # Fallback to direct call if handoff fails
-                context = await self.retriever_agent.run(user_input)
-            else:
-                context = retrieval_result["response"]
-            
-            # Now handoff to summarizer agent with the retrieved context
-            summarizer_result = await self.agent_handoff(
-                from_agent_id=self.retriever_agent.agent_id,
-                to_agent_id=self.summarizer_agent.agent_id,
-                reason="Context retrieved, now generate a comprehensive explanation based on the gathered information",
-                user_input=user_input,
-                context={
-                    "retrieved_context": context,
-                    "style": "detailed",
-                    "task": "explanation"
-                }
-            )
-            
-            if "error" in summarizer_result:
-                logger.error(f"Summarizer agent handoff failed: {summarizer_result['error']}")
-                # Fallback to direct call with enhanced prompt if handoff fails
-                enhanced_prompt = f"""
-Query: {user_input}
-
-Based on the following context, provide a detailed explanation:
-
-{context}
-"""
-                return await self.summarizer_agent.run(enhanced_prompt)
-            
-            return summarizer_result["response"]
-            
-        except Exception as e:
-            logger.error(f"Error in summary_workflow: {str(e)}")
-            raise  # Let the _run_with_fallback function handle it
-
-    async def research_workflow(self, user_input: str) -> str:
-        """
-        Handle research workflow with paper retrieval for research mode
-
-        Args:
-            user_input: The user's research query
-
-        Returns:
-            Research-oriented response with paper references
-        """
-        try:
-            # First handoff to retriever agent to get research papers and context
-            retrieval_result = await self.agent_handoff(
-                from_agent_id=self.researcher_agent.agent_id,  # Default agent
-                to_agent_id=self.retriever_agent.agent_id,
-                reason="Research query requires specialized papers and context retrieval for in-depth analysis",
-                user_input=user_input,
-                context={"task": "research_retrieval", "mode": "comprehensive", "require_papers": True}
-            )
-            
-            if "error" in retrieval_result:
-                logger.error(f"Retriever agent handoff failed: {retrieval_result['error']}")
-                # Fallback to direct call if handoff fails
-                context = await self.retriever_agent.run(user_input)
-            else:
-                context = retrieval_result["response"]
-            
-            # Now handoff to researcher agent with the retrieved context
-            research_result = await self.agent_handoff(
-                from_agent_id=self.retriever_agent.agent_id,
-                to_agent_id=self.researcher_agent.agent_id,
-                reason="Relevant papers retrieved, now generating in-depth research analysis based on academic sources",
-                user_input=user_input,
-                context={
-                    "retrieved_papers": context,
-                    "task": "research_analysis",
-                    "depth": "academic"
-                }
-            )
-            
-            if "error" in research_result:
-                logger.error(f"Researcher agent handoff failed: {research_result['error']}")
-                # Fallback to direct call with enhanced prompt if handoff fails
-                enhanced_prompt = f"""
-Research Query: {user_input}
-
-Based on the following research context and papers, provide an in-depth analysis:
-
-{context}
-
-Include relevant research findings, methodologies, and directions for further exploration.
-"""
-                response = await self.researcher_agent.run(enhanced_prompt)
-            else:
-                response = research_result["response"]
-            
-            # Handoff to verifier agent to verify the research response
-            verification_result = await self.agent_handoff(
-                from_agent_id=self.researcher_agent.agent_id,
-                to_agent_id=self.verifier_agent.agent_id,
-                reason="Research analysis completed, now verifying academic accuracy and removing any potential errors",
-                user_input=user_input,
-                context={
-                    "research_response": response,
-                    "task": "verification",
-                    "standard": "academic_rigor"
-                }
-            )
-            
-            if "error" in verification_result:
-                logger.error(f"Verifier agent handoff failed: {verification_result['error']}")
-                return response  # Return unverified response if verification fails
-                
-            verified_response = verification_result["response"]
-            
-            # Return either the verified response or the original if verification isn't appropriate
-            if "Error" in verified_response or len(verified_response) < len(response) / 2:
-                return response
-            
-            return verified_response
-            
-        except Exception as e:
-            logger.error(f"Error in research_workflow: {str(e)}")
-            raise  # Let the _run_with_fallback function handle it
-
-    async def agent_handoff(self, from_agent_id: str, to_agent_id: str, reason: str, user_input: str, 
-                     context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Handoff control from one agent to another with explicit reasoning
-
-        Args:
-            from_agent_id: ID of the agent handing off control
-            to_agent_id: ID of the agent receiving control
-            reason: Reasoning for why this handoff is occurring
-            user_input: The original user query or modified query
-            context: Optional context to pass to the receiving agent
-
-        Returns:
-            Dict containing the receiving agent's response and metadata
-        """
-        try:
-            # Get the agent instances
-            from_agent = self.agent_manager.get_agent_by_id(from_agent_id)
-            to_agent = self.agent_manager.get_agent_by_id(to_agent_id)
-            
-            if not from_agent or not to_agent:
-                logger.error(f"Handoff failed: Invalid agent IDs - from: {from_agent_id}, to: {to_agent_id}")
-                return {"error": "Invalid agent IDs for handoff"}
-            
-            # Record handoff in trace
-            handoff_record = {
-                "timestamp": self.memory_manager.get_timestamp(),
-                "from_agent": from_agent.__class__.__name__,
-                "to_agent": to_agent.__class__.__name__,
-                "reason": reason,
-                "query": user_input[:100] + ("..." if len(user_input) > 100 else "")  # Truncate for logging
-            }
-            
-            self.trace.append({
-                "stage": "agent_handoff",
-                "from": from_agent.__class__.__name__,
-                "to": to_agent.__class__.__name__, 
-                "reason": reason
-            })
-            
-            # Store handoff in history
-            if not hasattr(self, 'handoff_history'):
-                self.handoff_history = []
-            self.handoff_history.append(handoff_record)
-            
-            # Set the active agent in the agent manager
-            self.agent_manager.set_active_agent(to_agent_id)
-            
-            # Prepare enhanced prompt with reasoning and context
-            enhanced_input = user_input
-            if context:
-                context_str = "\n\n".join([f"{k}: {v}" for k, v in context.items()])
-                enhanced_input = f"""
-Query: {user_input}
-
-Context:
-{context_str}
-
-Reasoning: {reason}
-"""
-            
-            # Execute the receiving agent
-            logger.info(f"Agent handoff: {from_agent.__class__.__name__} -> {to_agent.__class__.__name__}, Reason: {reason}")
-            response = await to_agent.run(enhanced_input)
-            
-            return {
-                "agent": to_agent.__class__.__name__,
-                "response": response,
-                "handoff_record": handoff_record
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in agent_handoff: {str(e)}")
-            return {"error": f"Handoff failed: {str(e)}"}

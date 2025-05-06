@@ -5,6 +5,7 @@ Specialized agent for detecting user intents and applying guardrails.
 
 import logging
 import json
+import re
 from typing import Dict, Any, Optional, Tuple
 from backend.app.agents.agent_core import LLMAgent
 from backend.app.utils.llm import LLMConfig, LLMProvider
@@ -17,7 +18,7 @@ class IntentDetectorAgent(LLMAgent):
     
     def __init__(
         self,
-        model: str = "llama3-8b-8192",
+        model: str = "llama3-70b-8192",
         provider: str = "groq",
         agent_id: Optional[str] = None,
         temperature: float = 0.3,  # Lower temperature for more consistent outputs
@@ -29,6 +30,7 @@ class IntentDetectorAgent(LLMAgent):
 1. The type of query (chat/research)
 2. The depth of response needed (brief/detailed)
 3. Whether it's within allowed domains (Computer Science/Data Science)
+4. Be inclusive for educational questions related to Computer Science / Data Science!
 
 For chat mode:
 - Detect if user wants a brief summary or detailed explanation
@@ -78,7 +80,19 @@ Always respond with a structured output:
         Returns:
             Dictionary with intent classification
         """
-        # First check guardrails
+        # Check if it's a basic educational question first
+        is_educational_query, topic = self._is_educational_query(user_input)
+        if is_educational_query:
+            # For basic educational questions, always consider them valid
+            return {
+                "mode": "chat",
+                "depth": "detailed" if len(user_input) > 30 else "brief",
+                "requires_papers": False,
+                "domain_valid": True,
+                "reason": f"Educational question about {topic}"
+            }
+            
+        # Otherwise check guardrails for more complex questions
         check = await self.guardrails.check_input(user_input)
         if not check["passed"]:
             return {
@@ -97,6 +111,7 @@ Remember:
 - Only Computer Science and Data Science topics are valid
 - Detect if user wants brief summary or detailed explanation
 - Check if research papers/context are needed
+- Educational questions like "What is X?" are valid for CS/DS topics
 
 Respond with JSON only in the following format:
 {{
@@ -242,6 +257,58 @@ Respond with JSON only in the following format:
         except Exception as e:
             logger.warning(f"Error parsing intent data: {str(e)}")
             return None
+
+    def _is_educational_query(self, text: str) -> Tuple[bool, str]:
+        """
+        Check if this is a basic educational query that should be automatically allowed.
+        
+        Args:
+            text: The text to check
+            
+        Returns:
+            Tuple of (is_educational, topic)
+        """
+        # Common educational question patterns
+        educational_patterns = [
+            r"what (?:is|are) ([\w\s]+)\??",
+            r"(?:explain|describe|tell me about) ([\w\s]+)",
+            r"how (?:does|do) ([\w\s]+) work\??",
+            r"define ([\w\s]+)",
+            r"the concept of ([\w\s]+)"
+        ]
+        
+        # Check for educational patterns
+        text_lower = text.lower().strip()
+        
+        for pattern in educational_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                topic = match.group(1).strip()
+                
+                # Check if topic is related to CS/DS
+                cs_ds_terms = [
+                    "sentiment analysis", "machine learning", "neural network", "algorithm",
+                    "data", "program", "software", "hardware", "computer", "code",
+                    "network", "system", "ai", "artificial intelligence", "model",
+                    "database", "query", "computing", "deep learning", "nlp",
+                    "natural language processing", "statistic", "analysis",
+                    "classification", "regression", "clustering", "prediction",
+                    "feature", "training", "testing", "validation", "overfitting",
+                    "underfitting", "precision", "recall", "accuracy", "f1",
+                    "hadoop", "spark", "big data", "distributed", "cloud", "api",
+                    "rest", "graphql", "webapp", "frontend", "backend", "fullstack",
+                    "deployment", "devops", "continuous integration", "git"
+                ]
+                
+                # Check for exact topic or topic containing CS/DS terms
+                if topic in cs_ds_terms:
+                    return True, topic
+                    
+                for term in cs_ds_terms:
+                    if term in topic or topic in term:
+                        return True, topic
+        
+        return False, ""
 
     async def run(self, user_input: str) -> Dict[str, Any]:
         """Process user input and detect intent."""

@@ -209,3 +209,52 @@ class MCPProtocolHandler:
         """
         self.server_url = server_url
         self.logger = logging.getLogger(__name__)
+        self.user_query_history = []  # Store only user queries, not responses
+        self.max_query_history_length = 10  # Keep only last 10 user queries
+        self.max_query_length = 1000  # Maximum character length for stored queries
+
+    def add_user_query(self, query: str) -> None:
+        """
+        Add a user query to the history with character limit
+        
+        Args:
+            query: The user's query text
+        """
+        # Trim the query if it exceeds the maximum length
+        if len(query) > self.max_query_length:
+            trimmed_query = query[:self.max_query_length] + "..."
+            self.logger.info(f"Query trimmed from {len(query)} to {self.max_query_length} characters")
+        else:
+            trimmed_query = query
+            
+        # Add to history
+        self.user_query_history.append({
+            "query": trimmed_query,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Limit history length
+        if len(self.user_query_history) > self.max_query_history_length:
+            self.user_query_history = self.user_query_history[-self.max_query_history_length:]
+            
+    def get_recent_queries(self, limit: int = 3) -> List[str]:
+        """
+        Get the most recent user queries
+        
+        Args:
+            limit: Maximum number of queries to return
+            
+        Returns:
+            List of recent query strings
+        """
+        recent = self.user_query_history[-limit:] if len(self.user_query_history) > 0 else []
+        return [item["query"] for item in recent]
+        
+    def get_total_context_size(self) -> int:
+        """
+        Calculate the total size of stored context in characters
+        
+        Returns:
+            Total character count
+        """
+        return sum(len(item["query"]) for item in self.user_query_history)
